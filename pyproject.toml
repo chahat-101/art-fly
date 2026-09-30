@@ -1,0 +1,16 @@
+[project]
+name = "art-fly"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "neuprint-python>=0.6.3",
+    "numpy>=2.5.3",
+    "pandas>=3.0.5",
+    "scipy>=1.18.1",
+    "torch>=2.14.0",
+    "pillow>=12.0",
+    "moderngl>=5.12.0",
+    "glfw>=2.10.2",
+    "igraph>=1.0.0",
+]
