@@ -36,10 +36,10 @@ PALETTES = {k: np.array([_hex(c) for c in v], np.float32) for k, v in {
 }.items()}
 PAPER = (0.945, 0.925, 0.878)
 PAPER_ARR = np.array(PAPER, np.float32)
-STYLES = ["kandinsky", "mondrian", "cutout", "rothko"]
-STYLE_PALETTE = {"kandinsky": "bauhaus", "mondrian": "bauhaus", "cutout": "matisse", "rothko": "rothko"}
+STYLES = ["kandinsky", "cutout"]
+STYLE_PALETTE = {"kandinsky": "bauhaus", "cutout": "matisse"}
 
-MAIN_GROUPS = 14        # communities that get a full motif; the rest become small dots
+MAIN_GROUPS = 20        # communities that get a full motif; the rest become small dots
 FADE_TAU = 14.0         # s for an idle motif to fade
 GROW_TAU = 0.9          # s for an active motif to paint in
 RECOMPOSE_MIN = 16.0    # s between recompositions on odour onsets
@@ -338,12 +338,12 @@ class Painter:
         return out
 
     def _radii(self, r0, decay, rmin):
-        r = self.h * r0 * decay ** np.arange(self.M) * self.rng.uniform(0.85, 1.15, self.M)
+        r = self.h * r0 * decay ** np.arange(self.M) * self.rng.lognormal(0, 0.35, self.M)
         return np.maximum(r, rmin * self.h)
 
     def _relax(self, r, overlap):
         W, H = self.w, self.h
-        anchor = np.stack([self.ax[:self.M], self.ay[:self.M]], 1) + self.rng.normal(0, 0.03 * W, (self.M, 2))
+        anchor = np.stack([self.ax[:self.M], self.ay[:self.M]], 1) + self.rng.normal(0, 0.09 * W, (self.M, 2))
         p = anchor.copy()
         thirds = np.array([[W / 3, H / 3], [2 * W / 3, H / 3], [W / 3, 2 * H / 3], [2 * W / 3, 2 * H / 3]])
         focus = thirds[np.argmin(((thirds - p[0]) ** 2).sum(1))]
@@ -446,6 +446,7 @@ class Painter:
             els.append(El(K_LINE, -2, cx - np.cos(a) * L / 2, cy - np.sin(a) * L / 2, 0, rng.uniform(0.8, 1.8),
                           x2=cx + np.cos(a) * L / 2, y2=cy + np.sin(a) * L / 2, role=3, rough=0.3, z=5))
         els += self._dots(rng)
+        els += self._fill(rng, 70, "kandinsky")
         return els
 
     def _c_cutout(self):
@@ -472,6 +473,45 @@ class Painter:
             else:
                 els.append(El(K_DISC, i, x, y, ri * 0.7, role=roles[i], rough=2.0, z=2, seed=sd))
         els += self._dots(rng)
+        els += self._fill(rng, 45, "cutout")
+        return els
+
+    def _fill(self, rng, n, style):
+        """Small marks scattered into the empty parts of the canvas; they appear over the first seconds."""
+        W, H = self.w, self.h
+        pts = np.array([[m[0], m[1]] for m in self.main.values()])
+        rad = np.array([m[2] for m in self.main.values()])
+        placed, els = [], []
+        for _ in range(n * 12):
+            if len(els) >= n:
+                break
+            x, y = rng.uniform(0.03, 0.97) * W, rng.uniform(0.04, 0.96) * H
+            if (np.hypot(pts[:, 0] - x, pts[:, 1] - y) < rad * 0.9).any():
+                continue
+            if any(np.hypot(px - x, py - y) < rng.uniform(0.01, 0.07) * W for px, py in placed):
+                continue
+            placed.append((x, y))
+            sd, t0, a = rng.uniform(0, 100), self.t + rng.uniform(0, 10), rng.uniform(0, 2 * np.pi)
+            sz = min(0.06, 0.008 * rng.pareto(1.6) + 0.008) * H
+            role = int(rng.choice([0, 1, 2, 3, 4], p=[.3, .25, .15, .2, .1]))
+            if style == "cutout":
+                if rng.rand() < 0.6:
+                    els.append(El(K_BLOB, -1, x, y, sz * 1.6, sz * rng.uniform(0.5, 1.5), ang=a,
+                                  param=rng.uniform(0.1, 0.25), role=role, rough=1.6, z=2, seed=sd, t0=t0))
+                else:
+                    els.append(El(K_DISC, -1, x, y, sz, role=role, rough=1.8, z=2, seed=sd, t0=t0))
+            else:
+                k = rng.choice(4, p=[.4, .25, .2, .15])
+                if k == 0:
+                    els.append(El(K_DISC, -1, x, y, sz * 0.6, role=role, rough=0.8, z=6, seed=sd, t0=t0))
+                elif k == 1:
+                    els.append(El(K_RING, -1, x, y, sz, param=1.4, role=3, rough=0.6, z=4, seed=sd, t0=t0))
+                elif k == 2:
+                    L = sz * rng.uniform(2, 5)
+                    els.append(El(K_LINE, -1, x, y, 0, rng.uniform(0.8, 1.6), x2=x + np.cos(a) * L,
+                                  y2=y + np.sin(a) * L, role=3, rough=0.3, z=5, t0=t0))
+                else:
+                    els.append(El(K_TRI, -1, x, y, sz, ang=a, role=role, rough=1.0, z=3, seed=sd, t0=t0))
         return els
 
     def _c_mondrian(self):
@@ -540,7 +580,7 @@ class Painter:
 
     def _dots(self, rng):
         els = []
-        for gi in range(self.M, min(self.G, self.M + 30)):
+        for gi in range(self.M, min(self.G, self.M + 60)):
             els.append(El(K_DISC, gi, self.ax[gi] + rng.normal(0, 20), self.ay[gi] + rng.normal(0, 20),
                           rng.uniform(4, 11), role=int(rng.choice([3, 2, 1], p=[.6, .2, .2])), rough=0.6, z=6,
                           seed=rng.uniform(0, 100)))

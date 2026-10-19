@@ -7,7 +7,7 @@ gives the same painting and every seed gives a different one.
 
 examples:
   uv run make_art.py --seed 42                      # -> art/seed42_<style>_<palette>.png
-  uv run make_art.py --seed 1 2 3 --style mondrian  # several seeds, fixed style
+  uv run make_art.py --seed 1 2 3 --style cutout  # several seeds, fixed style
   uv run make_art.py --seed 7 --style all           # one painting per style
   uv run make_art.py --seed 9 --video               # also an mp4 (uv add "imageio[ffmpeg]")
   uv run make_art.py                                # random seed, printed so you can reuse it
