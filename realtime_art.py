@@ -2,6 +2,7 @@ import os
 import sys
 import numpy as np
 import moderngl
+import painter as P
 from painter import Painter
 
 
@@ -913,6 +914,22 @@ painter = Painter(
     seed=SEED,
     neuron_colors=colors,
 )
+
+# art direction from the environment: ART_ESSENCE="mess,aged" ART_PROMPT="neon cyber busy"
+pstyle, ppal, pess = P.parse_prompt(os.environ.get("ART_PROMPT", ""))
+ess = sorted({e.strip().lower() for e in os.environ.get("ART_ESSENCE", "").split(",") if e.strip()}
+             | set(pess))
+if pstyle or ess:
+    if pstyle and pstyle in P.STYLES:
+        while painter.style != pstyle:
+            painter.next_style()
+        print(f"[rt] prompt style {pstyle}")
+    if ppal and ppal in P.PALETTES:
+        painter.pal = ppal
+        print(f"[rt] prompt palette {ppal}")
+    painter.apply_tone(ess)
+    if ess:
+        print(f"[rt] tone {', '.join(painter.active_tone()) or 'none'}")
 st.mode = 4
 st.orbit = True
 

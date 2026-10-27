@@ -12,6 +12,8 @@ examples:
   uv run make_art.py --seed 9 --video               # also an mp4 (uv add "imageio[ffmpeg]")
   uv run make_art.py --seed 5 --fly                 # the painting appears stroke by stroke, brushed
                                                     # on by a little fly; writes an mp4 (--fly-speed)
+  uv run make_art.py --prompt "neon cyber busy"     # art direction in words: style, palette, tone
+  uv run make_art.py --seed 3 --essence mess,aged   # tone knobs: mess, flat, aged, warm, calm, busy
   uv run make_art.py                                # random seed, printed so you can reuse it
 """
 import argparse
@@ -142,7 +144,7 @@ def read_rgb(fbo, w, h):
 
 # ---------------------------------------------------------------- painting
 def paint(ctx, net, lay, *, seed, style, palette, seconds, start, size, video_path, fps,
-          fly=False, fly_speed=1.0):
+          fly=False, fly_speed=1.5, essence=()):
     spikes, _, colors, edges, signs, groups, _ = net
     T, N = spikes.shape
     w, h = size
@@ -155,6 +157,9 @@ def paint(ctx, net, lay, *, seed, style, palette, seconds, start, size, video_pa
     pt.old_els = []                              # no cross-fade from the default style
     if palette:
         pt.pal = palette
+    if essence:                                  # art-direction tone knobs
+        pt.apply_tone(essence)
+        print(f"[art]   tone: {', '.join(pt.active_tone()) or 'none'}")
     if fly:
         pt.fly_begin(fly_speed)                  # the painting hides until the fly brushes it
         pt.auto_recompose = False
@@ -220,9 +225,15 @@ def main():
                                  epilog="examples:" + __doc__.split("examples:")[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seed", type=int, nargs="+", help="one or more seeds (default: a random one)")
-    ap.add_argument("--style", default="random", choices=P.STYLES + ["random", "all"])
-    ap.add_argument("--palette", default="style", choices=list(P.PALETTES) + ["style", "random"],
-                    help="'style' uses the style's own palette (default)")
+    ap.add_argument("--style", default=None, choices=P.STYLES + ["random", "all"],
+                    help="default: from --prompt, else a seed-chosen style")
+    ap.add_argument("--palette", default=None, choices=list(P.PALETTES) + ["style", "random"],
+                    help="'style' uses the style's own palette; default: --prompt's palette, else "
+                         "the style's own")
+    ap.add_argument("--prompt", default="", help="art direction in words, e.g. 'neon cyber busy' "
+                                                 "(merged with the other flags)")
+    ap.add_argument("--essence", default="", help="extra tone keywords, comma-separated: "
+                                                  "mess, flat, aged, warm, calm, busy")
     ap.add_argument("--seconds", type=float, default=30.0, help="how long the network paints (default 30)")
     ap.add_argument("--start", type=int, help="first simulation step (default: chosen by the seed)")
     ap.add_argument("--size", default="1920x1080", help="WIDTHxHEIGHT (default 1920x1080)")
@@ -230,7 +241,7 @@ def main():
     ap.add_argument("--video", action="store_true", help="also write an mp4 of the painting being made")
     ap.add_argument("--fly", action="store_true",
                     help="reveal mode: the painting appears stroke by stroke as a little fly brushes it (writes mp4)")
-    ap.add_argument("--fly-speed", type=float, default=1.0, help="how fast the fly paints (default 1)")
+    ap.add_argument("--fly-speed", type=float, default=1.5, help="how fast the fly paints (default 1.5)")
     ap.add_argument("--fps", type=int, default=30, help="video frame rate (default 30)")
     ap.add_argument("--open", default=True, action=argparse.BooleanOptionalAction,
                     help="open the png in the default image viewer (default yes)")
@@ -246,6 +257,15 @@ def main():
     seeds = args.seed or [int.from_bytes(os.urandom(4), "little") % 1_000_000]
     os.makedirs(args.outdir, exist_ok=True)
 
+    # prompt and --essence merge into everything not given explicitly
+    pstyle, ppal, pess = P.parse_prompt(args.prompt)
+    essence = sorted({e.strip().lower() for e in args.essence.split(",") if e.strip()} | set(pess))
+    for e in essence:
+        if e not in P.TONE_KEYS:
+            sys.exit(f"[art] unknown --essence keyword '{e}' (choose from {', '.join(P.TONE_KEYS) or 'none'})")
+    if essence or args.prompt:
+        print(f"[art] prompt: style={pstyle} palette={ppal} essence={','.join(essence) or '-'}")
+
     from PIL import Image
     net = load_network(args.data, args.cache)
     lay = canvas_layout(net[1], net[6], w, h)
@@ -255,20 +275,24 @@ def main():
     for seed in seeds:
         rng = np.random.RandomState(seed)
         start = args.start if args.start is not None else int(rng.randint(T))
-        styles = P.STYLES if args.style == "all" else \
-            [P.STYLES[rng.randint(len(P.STYLES))] if args.style == "random" else args.style]
+        st_arg = args.style or pstyle or "random"
+        pal_arg = args.palette
+        styles = P.STYLES if st_arg == "all" else \
+            [P.STYLES[rng.randint(len(P.STYLES))] if st_arg == "random" else st_arg]
         for style in styles:
-            if args.palette == "random":
+            if pal_arg == "random":
                 pal = list(P.PALETTES)[rng.randint(len(P.PALETTES))]
+            elif pal_arg in (None, "style"):
+                pal = ppal or P.STYLE_PALETTE[style]
             else:
-                pal = P.STYLE_PALETTE[style] if args.palette == "style" else args.palette
+                pal = pal_arg
             name = f"seed{seed}_{style}_{pal}"
             print(f"[art] seed {seed}: {style} / {pal}, from step {start}")
             img = paint(ctx, net, lay, seed=seed, style=style, palette=pal, seconds=args.seconds, start=start,
                         size=(w, h),
                         video_path=os.path.join(args.outdir, name + ".mp4")
                         if (args.video or args.fly) else None,
-                        fps=args.fps, fly=args.fly, fly_speed=args.fly_speed)
+                        fps=args.fps, fly=args.fly, fly_speed=args.fly_speed, essence=essence)
             path = os.path.join(args.outdir, name + ".png")
             Image.fromarray(img).save(path)
             print(f"[art]   -> {path}" + (f"  and {name}.mp4" if args.video else ""))

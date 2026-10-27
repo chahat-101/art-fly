@@ -15,8 +15,11 @@ network paints in and out:
   * a new odour episode recomposes the canvas; the old composition stays ghosted
     underneath like an underpainting.
 
-Styles (S): kandinsky, mondrian, cutout (Matisse), rothko.   Palettes (P).
+Styles (S): kandinsky, cutout (Matisse), afklint, klee, pollock, force (futurist),
+mondrian, rothko, cyber (neon, dark).   Palettes (P).   Essence/prompt add mood knobs.
 """
+import re
+
 import numpy as np
 import moderngl
 
@@ -33,11 +36,18 @@ PALETTES = {k: np.array([_hex(c) for c in v], np.float32) for k, v in {
     "matisse": ["#E4572E", "#23408E", "#F3A712", "#141414", "#76B041"],
     "rothko":  ["#B23A2A", "#3B1F2B", "#E89F45", "#1A1416", "#D9B38C"],
     "miro":    ["#D62828", "#003049", "#FCBF49", "#111111", "#6A994E"],
+    "klint":   ["#C99B3F", "#7E6B8F", "#E9DCC6", "#3A2E46", "#8FB3A9"],
+    "neon":    ["#4DE8FF", "#8A5CFF", "#FF5CE3", "#EAF2FF", "#2A2440"],
 }.items()}
 PAPER = (0.945, 0.925, 0.878)
 PAPER_ARR = np.array(PAPER, np.float32)
-STYLES = ["kandinsky", "cutout"]
-STYLE_PALETTE = {"kandinsky": "bauhaus", "cutout": "matisse"}
+STYLES = ["kandinsky", "cutout", "afklint", "klee", "pollock", "force", "mondrian", "rothko", "cyber"]
+STYLE_PALETTE = {"kandinsky": "bauhaus", "cutout": "matisse", "afklint": "klint", "klee": "klee",
+                 "pollock": "miro", "force": "bauhaus", "mondrian": "bauhaus", "rothko": "rothko",
+                 "cyber": "neon"}
+STYLE_PAPER = {"cyber": (0.045, 0.035, 0.10)}          # per-style canvas tint (cyber paints in the dark)
+# art-direction knobs (essence / prompt)
+TONE_KEYS = ("mess", "flat", "aged", "warm", "calm", "busy")
 
 MAIN_GROUPS = 20        # communities that get a full motif; the rest become small dots
 FADE_TAU = 14.0         # s for an idle motif to fade
@@ -58,22 +68,22 @@ FLY_RATE = 13.0         # brush dabs per second at fly_speed = 1
 FLY_BRUSH = 26.0        # default brush radius, px
 FLY_TO_BRUSH = (13.0, 25.0)   # fly body -> brush tip offset (canvas space, y down)
 
-K_DISC, K_RING, K_RECT, K_TRI, K_LINE, K_ARC, K_BLOB, K_SOFT, K_HALF = range(9)
+K_DISC, K_RING, K_RECT, K_TRI, K_LINE, K_ARC, K_BLOB, K_SOFT, K_HALF, K_HEX = range(10)
 
 # ------------------------------------------------------------------ shaders
 VS_SHAPE = """
 #version 330
 uniform vec2 u_res;
-in vec2 in_quad; in vec4 in_a; in vec4 in_b; in vec4 in_c; in vec2 in_d;
-// a: cx cy sx sy | b: angle kind seed param | c: rgba | d: rough soft
-out vec2 v_q; flat out vec4 v_a; flat out vec4 v_b; flat out vec4 v_c; flat out vec2 v_d;
+in vec2 in_quad; in vec4 in_a; in vec4 in_b; in vec4 in_c; in vec3 in_d;
+// a: cx cy sx sy | b: angle kind seed param | c: rgba | d: rough soft bleed
+out vec2 v_q; flat out vec4 v_a; flat out vec4 v_b; flat out vec4 v_c; flat out vec3 v_d;
 void main(){
     int k = int(in_b.y + 0.5);
     vec2 s = in_a.zw;
     float pad = in_d.x*2.5 + in_d.y + 3.0;
     vec2 ext;
-    if (k == 2 || k == 7) ext = s + pad;
-    else if (k == 4)      ext = vec2(s.x + s.y, s.y) + pad;
+    if (k == 2 || k == 7 || k == 9) ext = s + pad;
+    else if (k == 4)               ext = vec2(s.x + s.y, s.y) + pad;
     else { float R = max(s.x, s.y); ext = vec2(R*1.55 + in_b.w + pad); }
     vec2 q = in_quad*ext;
     float c = cos(in_b.x), sn = sin(in_b.x);
@@ -91,7 +101,7 @@ float vnoise(vec2 p){
 
 FS_SHAPE = """
 #version 330
-in vec2 v_q; flat in vec4 v_a; flat in vec4 v_b; flat in vec4 v_c; flat in vec2 v_d;
+in vec2 v_q; flat in vec4 v_a; flat in vec4 v_b; flat in vec4 v_c; flat in vec3 v_d;
 out vec4 f;
 """ + NOISE + """
 float sdBox(vec2 p, vec2 b){ vec2 d = abs(p) - b; return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }
@@ -114,7 +124,7 @@ void main(){
     float seed = v_b.z, prm = v_b.w, d;
     if      (k == 0) d = length(p) - s.x;
     else if (k == 1) d = abs(length(p) - s.x) - prm;
-    else if (k == 2 || k == 7) d = sdBox(p, s);
+    else if (k == 2 || k == 7 || k == 9) d = sdBox(p, s);
     else if (k == 3) d = sdTri(p, s.x*0.866);
     else if (k == 4) d = length(p - vec2(clamp(p.x, -s.x, s.x), 0.0)) - s.y;
     else if (k == 5) d = sdArc(p, s.x, prm, s.y);
@@ -123,7 +133,8 @@ void main(){
         float w = 1.0 + prm*(sin(3.0*a + seed) + 0.6*sin(5.0*a + seed*2.3) + 0.3*sin(9.0*a + seed*3.1));
         d = (length(p/s) - w)*min(s.x, s.y);
     }
-    else d = max(length(p) - s.x, -p.y);                       // half disc
+    else if (k == 8) d = max(length(p) - s.x, -p.y);           // half disc
+    else d = max(abs(p.x)*0.8660251 + abs(p.y)*0.5, abs(p.y)) - s.x;   // hexagon
 
     float r = v_d.x;                                            // hand-cut / brushed edge
     if (k == 7) d += (vnoise(p*0.012 + seed) - 0.5)*2.0*r + (vnoise(p*0.05 + seed*3.0) - 0.5)*0.5*r;
@@ -132,6 +143,24 @@ void main(){
     float a;
     if (v_d.y > 0.0) a = 1.0 - smoothstep(-v_d.y, v_d.y*0.35, d);
     else             a = 1.0 - smoothstep(-0.8, 0.8, d);
+
+    // watercolour bleed: a wet halo strays past the cut and pigment pools darkly at it
+    float bl = v_d.z;
+    if (bl > 0.0) {
+        float bp = smoothstep(0.0, 10.0 + v_d.y*2.0 + r*1.5, d);
+        float w = d > 0.0 ? (1.0 - bp) : smoothstep(-18.0, -2.0, d);
+        a += w*bl*0.30;
+        if (a <= 0.002) discard;
+        vec2 g = gl_FragCoord.xy;
+        float tex = 0.92 + 0.08*vnoise(g*0.012 + seed) + 0.05*(vnoise(vec2(p.x*0.015, p.y*0.5) + seed) - 0.5);
+        if (k == 7) tex = 0.9 + 0.12*vnoise(p*vec2(0.004, 0.02) + seed) + 0.06*(vnoise(vec2(p.x*0.01, p.y*0.25)) - 0.5);
+        float edge = (v_d.y > 0.0) ? 0.0 : smoothstep(-7.0, 0.0, d);
+        vec3 c = v_c.rgb*tex*(1.0 - 0.08*edge);
+        c *= 1.0 - 0.20*w*bl;                                   // pooled pigment
+        c = mix(c, c*vec3(0.97, 0.99, 1.03), w*bl*0.5);         // watery cool wash outside
+        f = vec4(c, min(1.0, a)*v_c.a);
+        return;
+    }
     if (a <= 0.002) discard;
 
     // gouache: slow value variation, faint brush direction, pooled pigment at the edge
@@ -189,7 +218,7 @@ void main(){
 
 FS_POST = """
 #version 330
-uniform sampler2D u_tex; in vec2 v_uv; out vec4 f;
+uniform sampler2D u_tex; uniform float u_aged, u_warm; in vec2 v_uv; out vec4 f;
 """ + NOISE + """
 void main(){
     vec3 c = texture(u_tex, v_uv).rgb;
@@ -198,6 +227,12 @@ void main(){
     c *= paper;
     vec2 q = v_uv*2.0 - 1.0;
     c *= 1.0 - 0.07*dot(q, q);
+    if (u_aged > 0.0) {                                        // foxing: faint age spots
+        float fox = max(0.0, vnoise(g*0.05) - 0.35) * u_aged;
+        c *= 1.0 - 0.28*fox;
+        c += fox*vec3(0.045, 0.03, 0.0);
+    }
+    if (u_warm > 0.0) c = mix(c, c*vec3(1.06, 0.955, 0.84), clamp(u_warm, 0.0, 1.0)*0.4);
     c += (h2(g) - 0.5)/255.0*2.0;
     f = vec4(c, 1.0);
 }"""
@@ -206,6 +241,36 @@ void main(){
 def _smooth(e0, e1, x):
     u = np.clip((x - e0) / (e1 - e0), 0, 1)
     return u * u * (3 - 2 * u)
+
+
+def parse_prompt(text):
+    """'warm neon busy' -> (style, palette, essence-names). Words are loose hints;
+    anything not recognised is ignored. Returns (style|None, palette|None, [names])."""
+    words = set(w.lower() for w in re.findall(r"[a-zA-Z0-9]+", text or ""))
+    style = palette = None
+    ess = []
+    for w in sorted(words):
+        if w in STYLES:
+            style = w
+        if w in PALETTES:
+            palette = w
+        if w.startswith(("mess", "organic", "handmad")):
+            ess.append("mess")
+        if w.startswith(("flat", "print", "riso", "poster", "crisp", "clean")):
+            ess.append("flat")
+        if w.startswith(("old", "age", "vintage", "faded", "sepia", "tea")):
+            ess.append("aged")
+        if w.startswith(("warm", "sunset", "hot")):
+            ess.append("warm")
+        if w.startswith(("calm", "quiet", "serene", "gentle", "slow")):
+            ess.append("calm")
+        if w.startswith(("busy", "chaotic", "frantic", "dense", "alive")):
+            ess.append("busy")
+        if style is None and w.startswith(("cyber", "neon", "futur", "tech", "glow")):
+            style = "cyber"
+        if palette is None and w.startswith(("matisse", "bauhaus", "kandinsky", "miro")):
+            palette = {"matisse": "matisse", "bauhaus": "bauhaus", "kandinsky": "bauhaus", "miro": "miro"}[w]
+    return style, palette, sorted(set(ess) & set(TONE_KEYS))
 
 
 class El:
@@ -282,19 +347,32 @@ class Painter:
         self.inh_ema, self.inh_fast, self.inh_ink = None, 0.0, 0.0
         self.rate_ema, self.quiet = None, 0.0
         self.burst_cd = 0.0
+        # art-direction tone (essence / prompt knobs)
+        self.tone = dict((k, 0.0) for k in TONE_KEYS)
+        self.kick_scale = 1.0
+        self.spin_scale = 1.0
+        self.recompose_scale = 1.0
+        # inhibition-dominated communities make the fly hesitate
+        self.inh_share = (np.bincount(self.g, self.inh.astype(np.float64), self.G) / self.g_n
+                          if self.G else np.zeros(0))
         # fly reveal state
         self.fly_on = False
-        self.fly_speed = 1.0                          # dab/flight rate multiplier
+        self.fly_speed = 1.5                          # dab/flight rate multiplier
         self.fly_x, self.fly_y = w * 0.07, h * 0.90
         self.fly_ang = -np.pi / 2
-        self.fly_st = "rest"                          # rest | fly | work
+        self.fly_st = "rest"                          # rest | dip | hover | fly | work
         self.fly_plan, self.fly_set, self.fly_prog = [], set(), {}
         self.fly_i = 0
         self.fly_dabs, self.fly_di, self.fly_dabt = [], 0, 0.0
         self.fly_stamp = []                           # (x, y, r, alpha) dabs for this frame
+        self.fly_wait = 0.0                           # hold timer for dips and hovers
+        self.fly_dip_role = -1                        # role being dipped (or -1)
+        self.fly_ink_role = 0                         # colour currently on the bristles
+        self.fly_pots = {r: (0.90 * w + 0.038 * (r - 2) * w, 0.93 * h) for r in range(5)}
         self.t = 0.0
         self.style = "kandinsky"
         self.pal = STYLE_PALETTE[self.style]
+        self.paper = STYLE_PAPER.get(self.style, PAPER)
         self.accents, self.els, self.main = [], [], {}
         self._build_gl()
         self.clear()
@@ -325,10 +403,10 @@ class Painter:
         self.p_mask = ctx.program(vertex_shader=VS_QUAD, fragment_shader=FS_MASKED)
         self.p_shape["u_res"] = (w, h)
         self.p_dab["u_res"] = (w, h)
-        self.b_inst = ctx.buffer(reserve=1024 * 14 * 4, dynamic=True)
+        self.b_inst = ctx.buffer(reserve=1024 * 15 * 4, dynamic=True)
         self.b_dab = ctx.buffer(reserve=128 * 6 * 4, dynamic=True)
         self.v_shape = ctx.vertex_array(self.p_shape, [
-            (q, "2f", "in_quad"), (self.b_inst, "4f 4f 4f 2f/i", "in_a", "in_b", "in_c", "in_d")])
+            (q, "2f", "in_quad"), (self.b_inst, "4f 4f 4f 3f/i", "in_a", "in_b", "in_c", "in_d")])
         self.v_copy = ctx.vertex_array(self.p_copy, [(q, "2f", "in_quad")])
         self.v_wash = ctx.vertex_array(self.p_wash, [(q, "2f", "in_quad")])
         self.v_post = ctx.vertex_array(self.p_post, [(q, "2f", "in_quad")])
@@ -339,7 +417,7 @@ class Painter:
     def _wash(self, fbo, alpha):
         fbo.use()
         self.ctx.viewport = (0, 0, self.w, self.h)
-        self.p_wash["u_paper"], self.p_wash["u_alpha"] = PAPER, float(alpha)
+        self.p_wash["u_paper"], self.p_wash["u_alpha"] = self.paper, float(alpha)
         self.v_wash.render(moderngl.TRIANGLE_STRIP)
 
     def _copy(self, tex, alpha):
@@ -365,7 +443,7 @@ class Painter:
         if self.fly_on:
             self.fly_prog = {}                        # the fly repaints everything from scratch
 
-    def fly_begin(self, speed=1.0):
+    def fly_begin(self, speed=1.5):
         """Reveal mode on: the canvas hides until the fly brushes it, and the fly
         repaints the whole composition from scratch."""
         self.fly_speed = float(speed)
@@ -394,10 +472,25 @@ class Painter:
     def next_style(self):
         self.style = STYLES[(STYLES.index(self.style) + 1) % len(STYLES)]
         self.pal = STYLE_PALETTE[self.style]
+        self.paper = STYLE_PAPER.get(self.style, PAPER)
         self.ctx.disable(moderngl.BLEND)
         self._wash(self.under, 1.0)
         self.compose()
         return self.style
+
+    def apply_tone(self, names):
+        """Art-direction knobs (essence / prompt): mess flat aged warm calm busy."""
+        for n in names:
+            if n in self.tone:
+                self.tone[n] = min(1.0, self.tone[n] + 1.0)
+        t = self.tone
+        self.kick_scale = 0.55 + 0.45 * (1.0 - t["calm"])
+        self.spin_scale = 0.5 + 0.5 * (1.0 - t["calm"])
+        self.recompose_scale = 1.0 + 0.8 * t["calm"] - 0.35 * t["busy"]
+        return self.active_tone()
+
+    def active_tone(self):
+        return sorted(k for k, v in self.tone.items() if v > 0)
 
     def next_palette(self):
         names = list(PALETTES)
@@ -436,7 +529,8 @@ class Painter:
 
     def _relax(self, r, overlap):
         W, H = self.w, self.h
-        anchor = np.stack([self.ax[:self.M], self.ay[:self.M]], 1) + self.rng.normal(0, 0.09 * W, (self.M, 2))
+        anchor = np.stack([self.ax[:self.M], self.ay[:self.M]], 1) \
+            + self.rng.normal(0, 0.09 * W * (1.0 + 1.2 * self.tone["mess"]), (self.M, 2))
         p = anchor.copy()
         thirds = np.array([[W / 3, H / 3], [2 * W / 3, H / 3], [W / 3, 2 * H / 3], [2 * W / 3, 2 * H / 3]])
         focus = thirds[np.argmin(((thirds - p[0]) ** 2).sum(1))]
@@ -472,6 +566,8 @@ class Painter:
         self.fly_i = 0
         self.fly_st, self.fly_dabs, self.fly_di = "fly", [], 0
         self.fly_set = set(els)
+        self.fly_wait = 0.0
+        self.fly_dip_role = -1
 
     def _fly_plan(self):
         """Painting order: big background shapes first, small details last."""
@@ -581,6 +677,7 @@ class Painter:
 
     def _fill(self, rng, n, style):
         """Small marks scattered into the empty parts of the canvas; they appear over the first seconds."""
+        n = int(round(n * (1.0 + 0.5 * self.tone["busy"])))
         W, H = self.w, self.h
         pts = np.array([[m[0], m[1]] for m in self.main.values()])
         rad = np.array([m[2] for m in self.main.values()])
@@ -681,6 +778,241 @@ class Painter:
             yy -= hs[n] + gap
         return els
 
+    def _comm_anchors(self, k=8, rr=0.05):
+        """Small anatomical anchors for styles that don't give communities their own motif."""
+        W, H = self.w, self.h
+        out = {}
+        for gi in range(min(k, self.G)):
+            out[gi] = (self.ax[gi], self.ay[gi], rr * H)
+        return out
+
+    def _c_afklint(self):
+        """Hilma af Klint: pale washes, concentric ring stacks, mirrored arcs and doves."""
+        rng, W, H, M = self.rng, self.w, self.h, self.M
+        els = [El(K_SOFT, -1, W / 2, H / 2, W / 2 + 40, H / 2 + 40, role=4, soft=30, rough=4,
+                  amax=0.75, grow=False, z=0, t0=self.t)]
+        r = self._radii(0.15, 0.78, 0.028)
+        p = self._relax(r, 0.7)
+        roles = self._roles(M)
+        for i in range(M):
+            x, y, ri, sd = p[i, 0], p[i, 1], r[i], rng.uniform(0, 100)
+            self.main[i] = (x, y, ri)
+            if i == 0:                     # the sun: nested rings, one hue deepening inward
+                els.append(El(K_SOFT, 0, x, y, ri * 1.35, role=4, soft=ri * 0.2, rough=3,
+                              amax=0.55, grow=False, z=0, seed=sd))
+                els.append(El(K_DISC, 0, x, y, ri, role=1, amax=0.92, rough=1.4, z=1, seed=sd))
+                for k in range(rng.randint(2, 5)):
+                    els.append(El(K_RING, 0, x, y, ri * (0.85 - 0.16 * k), param=max(1.4, ri * 0.045),
+                                  role=[3, 2, 4][k % 3], amax=0.85, rough=0.8, z=3, seed=sd + 1 + k))
+                continue
+            k = int(rng.choice([K_RING, K_ARC, K_TRI, K_HALF, K_DISC], p=[.3, .22, .18, .2, .1]))
+            if k == K_RING:
+                els.append(El(K_RING, i, x, y, ri, param=max(2.0, ri * rng.uniform(.06, .12)),
+                              role=roles[i], rough=1.1, z=2, seed=sd))
+                if rng.rand() < 0.5:
+                    els.append(El(K_RING, i, x, y, ri * 0.72, param=max(1.5, ri * 0.035),
+                                  role=(roles[i] + 2) % 5, rough=0.9, z=3, seed=sd + 1))
+            elif k == K_ARC:               # mirrored arc pair above and below the motif
+                th = max(2.0, ri * 0.05)
+                for s in (-1.0, 1.0):
+                    els.append(El(K_ARC, i, x, y, ri * 1.05, th, ang=1.9 if s < 0 else 1.25,
+                                  param=1.7, role=roles[i] if s > 0 else (roles[i] + 1) % 5,
+                                  rough=0.8, z=3, seed=sd + 1))
+            elif k == K_TRI:
+                els.append(El(K_TRI, i, x, y, ri * 0.9, ang=rng.uniform(-0.2, 0.2),
+                              role=roles[i], rough=1.2, z=2, seed=sd))
+            elif k == K_HALF:
+                els.append(El(K_HALF, i, x, y, ri, ang=rng.uniform(-np.pi, np.pi),
+                              role=roles[i], rough=1.2, z=2, seed=sd))
+            else:
+                els.append(El(K_DISC, i, x, y, ri * 0.8, role=roles[i], amax=0.9, rough=1.4, z=2, seed=sd))
+        # the doves: a mirrored half-disc pair aligned to the central axis
+        yy = H * rng.uniform(0.34, 0.52)
+        off = W * rng.uniform(0.09, 0.14)
+        q = H * rng.uniform(0.07, 0.09)
+        for s in (-1.0, 1.0):
+            els.append(El(K_HALF, int(rng.randint(1, max(2, M))), W / 2 + s * off, yy, q,
+                          ang=np.pi if s < 0 else 0.0,
+                          role=0 if s > 0 else 2, rough=1.5, z=2, seed=rng.uniform(0, 100)))
+        els += self._dots(rng)
+        els += self._fill(rng, 46, "afklint")
+        return els
+
+    def _c_klee(self):
+        """Paul Klee: a hand-wobbled mosaic of small flat cells, one community each."""
+        rng, W, H, M = self.rng, self.w, self.h, self.M
+        els = [El(K_SOFT, -1, W / 2, H / 2, W / 2 + 60, H / 2 + 60, role=4, soft=44, rough=6,
+                  amax=0.6, grow=False, z=0, t0=self.t)]
+        gx, gy = int(rng.randint(3, 6)), int(rng.randint(3, 6))
+        cells = [(ix, iy) for iy in range(gy) for ix in range(gx)]
+        rng.shuffle(cells)
+        free = list(range(M))
+        mess = 1.0 + 1.2 * self.tone["mess"]
+        for ix, iy in cells:
+            if not free:
+                break
+            cx0, cy0 = ix * W / gx, iy * H / gy
+            mx, my = cx0 + W / gx / 2, cy0 + H / gy / 2
+            gi = min(free, key=lambda q: (self.ax[q] - mx) ** 2 + (self.ay[q] - my) ** 2)
+            free.remove(gi)
+            mx += rng.normal(0, 0.08 * W / gx) * mess
+            my += rng.normal(0, 0.12 * H / gy) * mess
+            cw, ch = W / gx * 0.72, H / gy * 0.72
+            ri = max(8.0, min(cw, ch) * 0.5 * rng.uniform(0.6, 0.9))
+            self.main[gi] = (mx, my, ri)
+            sd = rng.uniform(0, 100)
+            role = int(rng.choice([0, 1, 2, 3, 4], p=[.34, .27, .12, .09, .18]))
+            ang = rng.uniform(-0.2, 0.2) * mess
+            if rng.rand() < 0.62:
+                els.append(El(K_RECT, gi, mx, my, cw * rng.uniform(0.5, 0.95), ch * rng.uniform(0.4, 0.9),
+                              ang=ang, role=role, amax=0.92, rough=0.7, z=2, seed=sd))
+            elif rng.rand() < 0.75:
+                els.append(El(K_DISC, gi, mx, my, ri, role=role, amax=0.92, rough=0.8, z=2, seed=sd))
+                if rng.rand() < 0.4:
+                    els.append(El(K_DISC, gi, mx, my, ri * 0.5, role=(role + 2) % 5, rough=0.8,
+                                  z=3, seed=sd + 1))
+            else:                          # a stepped stair of flat bars
+                for k in range(3):
+                    els.append(El(K_RECT, gi, mx - cw * 0.5 + k * cw * 0.33, my + (k - 1) * ch * 0.22,
+                                  cw * rng.uniform(0.28, 0.42), ch * rng.uniform(0.12, 0.3),
+                                  ang=ang, role=(role + k) % 5, amax=0.9, rough=0.7, z=2, seed=sd + k))
+        els += self._dots(rng)
+        els += self._fill(rng, 40, "klee")
+        return els
+
+    def _c_pollock(self):
+        """Jackson Pollock: tangled throw curves and splats laid over a warm wash."""
+        rng, W, H = self.rng, self.w, self.h
+        els = [El(K_SOFT, -1, W / 2, H / 2, W / 2 + 50, H / 2 + 50, role=4, soft=50, rough=6,
+                  amax=0.38, grow=False, z=0, t0=self.t)]
+        self.main.update(self._comm_anchors(8, 0.05))
+        mess = 1.0 + 1.4 * self.tone["mess"]
+        for _th in range(int(rng.randint(6, 10))):
+            role = int(rng.choice([0, 1, 2, 3, 4], p=[.2, .25, .25, .2, .1]))
+            x, y = rng.uniform(0.05, 0.95) * W, rng.uniform(0.05, 0.95) * H
+            for _s in range(rng.randint(2, 4)):            # the throw arcs between anchors
+                a = rng.uniform(0, 2 * np.pi)
+                L = rng.uniform(0.18, 0.42) * W * mess
+                px, py = x + np.cos(a) * L, y + np.sin(a) * L
+                cx = x + np.cos(a + rng.uniform(-0.7, 0.7) * mess) * L * rng.uniform(0.25, 0.55)
+                cy = y + np.sin(a + rng.uniform(-0.7, 0.7) * mess) * L * rng.uniform(0.25, 0.55)
+                nsub = int(rng.randint(3, 7))
+                sy = rng.uniform(0.7, 2.3)
+
+                def bez(uu, x=x, y=y, px=px, py=py, cx=cx, cy=cy):
+                    return ((1 - uu) ** 2 * x + 2 * (1 - uu) * uu * cx + uu ** 2 * px,
+                            (1 - uu) ** 2 * y + 2 * (1 - uu) * uu * cy + uu ** 2 * py)
+
+                for k in range(nsub):                      # subdivide the curve into short strokes
+                    u0, u1 = k / nsub, (k + 1.4) / nsub
+                    x0, y0 = bez(np.clip(u0, 0.0, 1.0))
+                    x1, y1 = bez(np.clip(u1, 0.0, 1.0))
+                    els.append(El(K_LINE, -1, x0, y0, 0, sy * rng.uniform(0.75, 1.25),
+                                  x2=x1, y2=y1, role=role, rough=0.25, z=3, seed=rng.uniform(0, 100)))
+                x, y = px, py
+        for _sp in range(int(rng.randint(14, 24) * (1 + 0.4 * self.tone["busy"]))):
+            cx2, cy2 = rng.uniform(0.05, 0.95) * W, rng.uniform(0.05, 0.95) * H
+            base = rng.uniform(0, 2 * np.pi)
+            for k in range(rng.randint(1, 3)):
+                aa = base + rng.uniform(0, 2.6)
+                L = rng.uniform(8, 30)
+                els.append(El(K_LINE, -1, cx2, cy2, 0, rng.uniform(0.5, 1.1),
+                              x2=cx2 + np.cos(aa) * L, y2=cy2 + np.sin(aa) * L, role=3, rough=0.2, z=4,
+                              seed=rng.uniform(0, 100)))
+            if rng.rand() < 0.7:
+                els.append(El(K_DISC, -1, cx2 + rng.uniform(-8, 8), cy2 + rng.uniform(-8, 8),
+                              rng.uniform(2, 6), role=int(rng.choice([0, 2, 3])), rough=0.5, z=4,
+                              seed=rng.uniform(0, 100)))
+        els += self._fill(rng, 26, "pollock")
+        return els
+
+    def _c_force(self):
+        """Futurist force lines: long blades and fanned repeats along dominant diagonals."""
+        rng, W, H, M = self.rng, self.w, self.h, self.M
+        els = [El(K_SOFT, -1, W / 2, H / 2, W / 2 + 60, H / 2 + 60, role=4, soft=46, rough=6,
+                  amax=0.42, grow=False, z=0, t0=self.t)]
+        self.main.update(self._comm_anchors(8, 0.06))
+        ba = rng.uniform(-0.55, 0.55)
+        for k in range(3):                         # three dominant blades through the canvas
+            y0 = H * (0.25 + 0.28 * k) * rng.uniform(0.85, 1.15)
+            slope = np.tan(ba + rng.uniform(-0.16, 0.16))
+            yy1 = np.clip(y0 + slope * W, 0.06 * H, 0.94 * H)
+            cxm, cym = W * 0.5, (y0 + yy1) / 2
+            L = np.hypot(W * 1.2, yy1 - y0)
+            role = [0, 1, 2][k]
+            els.append(El(K_TRI, -1, cxm, cym, L * 0.5, rng.uniform(2.0, 6.5),
+                          ang=np.arctan2(yy1 - y0, W * 1.2) + (np.pi if k == 1 else 0.0),
+                          role=role, amax=0.9, rough=0.5, z=2, seed=rng.uniform(0, 100)))
+        for gi in list(self.main)[:M]:             # fanned repeats off every anchor
+            x, y, _r = self.main[gi]
+            base = ba + rng.uniform(-0.5, 0.5)
+            for k in range(rng.randint(3, 6)):
+                a = base + 0.055 * k * rng.choice([-1.0, 1.0])
+                L = rng.uniform(0.2, 0.5) * W
+                els.append(El(K_LINE, -1, x, y, 0, rng.uniform(0.9, 2.0),
+                              x2=x + np.cos(a) * L, y2=y + np.sin(a) * L,
+                              role=3 if k % 2 else int(self.rng.choice([0, 1, 2])), rough=0.3, z=3,
+                              seed=rng.uniform(0, 100)))
+            if rng.rand() < 0.5:                   # an arc sweep crossing the node
+                els.append(El(K_ARC, -1, x, y, H * rng.uniform(0.16, 0.3), max(2.0, H * 0.008),
+                              ang=base, param=rng.uniform(0.8, 1.7), role=int(rng.choice([0, 1, 2, 3])),
+                              rough=0.6, z=2, seed=rng.uniform(0, 100)))
+        els += self._dots(rng)
+        els += self._fill(rng, 34, "force")
+        return els
+
+    def _c_cyber(self):
+        """Neon/futurist: dark horizon, a glowing core, HUD hex grids and circuit traces."""
+        rng, W, H, M = self.rng, self.w, self.h, self.M
+        els = [
+            El(K_SOFT, -1, W / 2, H * 0.34, W * 0.62, H * 0.34, role=1, soft=64, rough=8,
+               amax=0.5, grow=False, z=0, t0=self.t),
+            El(K_SOFT, -1, W / 2, H * 0.9, W * 0.58, H * 0.18, role=0, soft=44, rough=6,
+               amax=0.32, grow=False, z=0, t0=self.t + 0.5),
+        ]
+        sx, sy = W * (0.3 + 0.4 * rng.rand()), H * rng.uniform(0.26, 0.44)     # the core
+        els.append(El(K_SOFT, 0, sx, sy, H * 0.3, H * 0.3, role=1, soft=H * 0.13, rough=3,
+                      amax=0.45, grow=False, z=1, seed=rng.uniform(0, 100)))
+        els.append(El(K_DISC, 0, sx, sy, H * 0.085, role=2, amax=0.96, rough=0.5, z=2,
+                      seed=rng.uniform(0, 100)))
+        els.append(El(K_RING, 0, sx, sy, H * 0.135, param=1.5, role=1, amax=0.5, rough=0.4, z=2,
+                      seed=rng.uniform(0, 100)))
+        self.main[0] = (sx, sy, H * 0.11)
+        for gi in range(1, min(6, M)):             # circuit traces with live signal pulses
+            x0, y0 = self.ax[gi], self.ay[gi]
+            stroke = int(rng.choice([0, 1]))
+            x1 = np.clip(self.ax[int(rng.randint(1, max(2, M)))], 0.08 * W, 0.92 * W)
+            y1 = np.clip(self.ay[int(rng.randint(1, max(2, M)))], 0.08 * H, 0.9 * H)
+            g2i = int(rng.randint(1, max(2, M)))
+            if stroke:                             # horizontal then vertical
+                pts = [(x0, y0), (x1, y0), (x1, y1)]
+            else:
+                pts = [(x0, y0), (x0, y1), (x1, y1)]
+            for k in range(2):
+                (ax0, ay0), (ax1, ay1) = pts[k], pts[k + 1]
+                els.append(El(K_LINE, gi, ax0, ay0, 0, 0.9, x2=ax1, y2=ay1, role=3, g2=g2i,
+                              rough=0.12, z=5, seed=rng.uniform(0, 100)))
+            self.main[gi] = (x0, y0, H * 0.045)
+        qh = max(20.0, H * 0.038)                  # jittered HUD hex grid
+        for iy in range(int(H / qh / 2) + 1):
+            for ix in range(int(W / max(qh * 1.1, 24)) + 1):
+                x = ix * qh * 1.1 + rng.normal(0, 3)
+                y = iy * qh * 2 + (qh if iy % 2 else 0) + rng.normal(0, 3)
+                if np.hypot(x - sx, y - sy) < H * 0.3:
+                    continue
+                if rng.rand() < 0.35:
+                    continue
+                rh = qh * rng.uniform(0.16, 0.3)
+                els.append(El(K_HEX, -1, x, y, rh, role=4, rough=0.7, z=4,
+                              seed=rng.uniform(0, 100), amax=0.22 + 0.3 * rng.rand()))
+        for _k in range(4):                        # thin neon rings around focal points
+            x, y, ri = self.main[int(rng.randint(0, max(1, min(4, M))))]
+            els.append(El(K_RING, -1, x, y, ri * rng.uniform(1.2, 2.0), param=1.3, role=1,
+                          amax=0.35, rough=0.3, z=5, seed=rng.uniform(0, 100)))
+        els += self._dots(rng)
+        els += self._fill(rng, 30, "cyber")
+        return els
+
     def _dots(self, rng):
         els = []
         for gi in range(self.M, min(self.G, self.M + 60)):
@@ -745,6 +1077,26 @@ class Painter:
                 self.fly_y += (ty - self.fly_y) / d * u
                 self._fly_turn(np.arctan2(ty - self.fly_y, tx - self.fly_x), 4.0 * dt)
             return
+        if self.fly_st == "dip":                       # detour to a paint pot and reload the brush
+            px, py = self.fly_pots[self.fly_dip_role]
+            d = np.hypot(px - self.fly_x, py - self.fly_y)
+            if d > 3.0:
+                u = min(speed * 0.5 * dt, d)
+                self._fly_turn(np.arctan2(py - self.fly_y, px - self.fly_x), 6.0 * dt)
+                self.fly_x += (px - self.fly_x) / d * u
+                self.fly_y += (py - self.fly_y) / d * u
+            else:
+                self.fly_ink_role = self.fly_dip_role
+                self.fly_dip_role = -1
+                self.fly_st = "fly"
+            return
+        if self.fly_st == "hover":                     # holding still before a big or charged mark
+            self.fly_wait -= dt
+            self.fly_x += np.sin(self.t * 2.2) * dt * 8.0
+            self.fly_y += np.cos(self.t * 1.7) * dt * 6.0
+            if self.fly_wait <= 0.0:
+                self.fly_st = "fly"
+            return
         if self.fly_i >= len(self.fly_plan):           # a recompose can only lengthen the plan
             self.fly_st = "rest"
             return
@@ -764,17 +1116,41 @@ class Painter:
                     self.fly_st = "fly"
                     return
                 self.fly_di = 0
+                # hesitation: hold back before big fills and before inhibition-heavy communities
+                big = e.kind in (K_SOFT, K_RECT, K_BLOB) or e.sx * e.sy > 0.03 * self.w * self.h
+                inhg = float(self.inh_share[e.g]) if e.g >= 0 else 0.0
+                if big or inhg > 0.5:
+                    self.fly_wait = (0.45 if inhg > 0.5 else 0.25) / self.fly_speed
+                    self.fly_st = "hover"
+                    return
             else:                                      # last dab done: element is painted
                 self.fly_prog[e] = 1.0
                 self.fly_i += 1
                 self.fly_dabs, self.fly_di = [], 0
-                self.fly_st = "fly"
+                nxt, j = None, self.fly_i              # reload the brush if the next colour differs
+                while j < len(self.fly_plan):
+                    ne = self.fly_plan[j]
+                    if self.fly_prog.get(ne, 0.0) < 1.0:
+                        nxt = ne
+                        break
+                    j += 1
+                if nxt is not None and int(np.clip(nxt.role, 0, 4)) != self.fly_ink_role \
+                        and self.rng.rand() < 0.8:
+                    self.fly_dip_role = int(np.clip(nxt.role, 0, 4))
+                    self.fly_st = "dip"
+                else:
+                    self.fly_st = "fly"
                 return
         tx, ty = self.fly_dabs[self.fly_di]
         bx, by = tx - FLY_TO_BRUSH[0], ty - FLY_TO_BRUSH[1]     # body stops where the tip touches
+        inhg = float(self.inh_share[e.g]) if e.g >= 0 else 0.0
+        sp = speed * (0.45 if inhg > 0.45 else 1.0)             # charged moments slow the fly
+        if inhg > 0.45:                                         # and it trembles, like the network does
+            bx += np.sin(self.t * 9.0) * 2.0
+            by += np.cos(self.t * 9.7) * 2.0
         d = np.hypot(bx - self.fly_x, by - self.fly_y)
-        if d > max(2.0, speed * dt):
-            u = min(speed * dt, d)
+        if d > max(2.0, sp * dt):
+            u = min(sp * dt, d)
             self._fly_turn(np.arctan2(by - self.fly_y, bx - self.fly_x), 6.0 * dt)
             self.fly_x += (bx - self.fly_x) / d * u
             self.fly_y += (by - self.fly_y) / d * u
@@ -791,33 +1167,37 @@ class Painter:
         d = (ta - self.fly_ang + np.pi) % (2 * np.pi) - np.pi
         self.fly_ang += d * min(1.0, u)
 
-    def _fly_rows(self, rows, pal):
-        """The fly itself: body, wings, brush and its little community badge (brain)."""
+    def _fly_rows(self, pal):
+        """The fly, its paint pots, brush and community badge — rendered unmasked over the canvas."""
         if not self.fly_on:
-            return
+            return np.zeros((0, 15), "f4")
         t = self.t
         fx, fy = self.fly_x, self.fly_y
         ang = self.fly_ang
         tx, ty = fx + FLY_TO_BRUSH[0], fy + FLY_TO_BRUSH[1]
+        rows = []
+        # paint pots sit along the right edge, one per role; rims glow with the colour inside
+        for ri, (px, py) in self.fly_pots.items():
+            rows.append([px, py, 6.0, 5.0, 0, K_DISC, 4.0, 0, *(pal[ri] * 0.75), 0.85, 0.3, 0, 0])
+            rows.append([px, py, 7.0, 6.2, 0, K_RING, 4.0, 1.2, *pal[ri], 0.5, 0.4, 0, 0])
         # wings
-        wf = np.sin(t * 36.0) * 0.30
+        wf = np.sin(t * 36.0 / self.fly_speed ** 0.4) * 0.30
         for s in (-1.0, 1.0):
             wa = ang + s * (1.20 + wf)
             rows.append([fx - np.cos(ang) * 4.0, fy - np.sin(ang) * 4.0 - 2.0 * s * np.sin(wa) * 0.2,
-                         2.6, 10.5, wa, K_DISC, 4.0, 0, *pal[4], 0.40, 0.6, 0])
-        # brush handle and bristle
+                         2.6, 10.5, wa, K_DISC, 4.0, 0, *pal[4], 0.40, 0.6, 0, 0])
+        # brush handle and bristle (the tip carries the colour of the current pot)
         L = np.hypot(tx - fx, ty - fy) + 1e-3
         rows.append([(fx + tx) / 2, (fy + ty) / 2, L / 2, 1.8, np.arctan2(ty - fy, tx - fx),
-                     K_LINE, 4.0, 0, *pal[3], 0.95, 0.25, 0])
-        if self.fly_st == "work" and self.fly_i < len(self.fly_plan):
-            e = self.fly_plan[self.fly_i]
-            rows.append([tx, ty, 4.4, 4.4, 0, K_DISC, 4.0, 0, *pal[min(e.role, 4)], 0.85, 0.15, 0])
+                     K_LINE, 4.0, 0, *pal[3], 0.95, 0.25, 0, 0])
+        bc = pal[self.fly_ink_role] if self.fly_ink_role >= 0 else pal[3]
+        rows.append([tx, ty, 3.0, 3.0, 0, K_DISC, 4.0, 0, *bc, 0.85, 0.15, 0, 0])
         # body, head, stripes
-        rows.append([fx, fy, 5.5, 9.5, ang, K_DISC, 4.0, 0, *pal[3], 0.96, 0.6, 0])
+        rows.append([fx, fy, 5.5, 9.5, ang, K_DISC, 4.0, 0, *pal[3], 0.96, 0.6, 0, 0])
         rows.append([fx + np.cos(ang) * 7.0, fy + np.sin(ang) * 7.0, 3.2, 3.4, ang, K_DISC, 4.0, 0,
-                     *pal[3], 1.0, 0.4, 0])
+                     *pal[3], 1.0, 0.4, 0, 0])
         rows.append([fx - np.cos(ang) * 5.0, fy - np.sin(ang) * 5.0, 2.4, 4.6, ang, K_DISC, 4.0, 0,
-                     *pal[2], 0.55, 0.4, 0])
+                     *pal[2], 0.55, 0.4, 0, 0])
         # brain badge: the community this fly is painting, glowing with its activity
         g = -1
         if self.fly_st == "work" and self.fly_i < len(self.fly_plan):
@@ -826,9 +1206,10 @@ class Painter:
         if g < 0:
             g = int(np.argmax(self.fast))
         by = fy - 30.0 + 1.6 * np.sin(t * 3.1)
-        bc = pal[3] if self.com_col is None else np.clip(self.com_col[g], 0, 1)
-        rows.append([fx, by, 6.5, 6.5, 0, K_RING, 4.0, 1.7, *bc, 0.85, 0.3, 0])
-        rows.append([fx, by, 3.2, 3.2, 0, K_DISC, 4.0, 0, *bc, 0.15 + 0.75 * float(self.fast[g]), 0.2, 0])
+        cc = pal[3] if self.com_col is None else np.clip(self.com_col[g], 0, 1)
+        rows.append([fx, by, 6.5, 6.5, 0, K_RING, 4.0, 1.7, *cc, 0.85, 0.3, 0, 0])
+        rows.append([fx, by, 3.2, 3.2, 0, K_DISC, 4.0, 0, *cc, 0.15 + 0.75 * float(self.fast[g]), 0.2, 0, 0])
+        return np.asarray(rows, "f4").reshape(-1, 15)
 
     # ------------------------------------------------------------ accents
     def _ripple(self, gi, n):
@@ -870,9 +1251,19 @@ class Painter:
             pos[j] = (mx, my)
         d = pos - np.array([x, y])
         dist = np.hypot(d[:, 0], d[:, 1]) + 1e-6
-        kick = KICK * np.exp(-dist / (0.35 * W))
+        kick = KICK * self.kick_scale * np.exp(-dist / (0.35 * W))
         kick[gi] = 0.0
         self.vel += d / dist[:, None] * kick[:, None]
+        if self.style == "pollock":                  # the burst flings a splash of splats around
+            for _ in range(int(rng.randint(3, 6))):
+                a = rng.uniform(0, 2 * np.pi)
+                L = rng.uniform(0.10, 0.25) * W
+                e = El(K_LINE, -3, x, y, 0, rng.uniform(1.0, 2.4),
+                       x2=x + np.cos(a) * L, y2=y + np.sin(a) * L,
+                       role=int(rng.choice([0, 1, 2, 3])), rough=0.3, z=6, g2=gi)
+                self.accents.append(e)
+            self.accents = self.accents[-MAX_ACCENTS:]
+            return
         if self.style == "rothko":
             return
         self._ripple(gi, int(rng.randint(1, 3)))
@@ -912,7 +1303,8 @@ class Painter:
     def _instances(self, pal, dt):
         rows = []
         t = self.t
-        live = self.style in ("kandinsky", "cutout")
+        live = self.style in ("kandinsky", "cutout", "cyber")
+        flat = self.tone["flat"]
         fin = float(_smooth(0, XFADE, t - self.t_compose))
         fout = 1.0 - float(_smooth(0, XFADE, t - self.t_old))
         layers = [(e, fout) for e in self.old_els] if fout > 0.01 else []
@@ -940,7 +1332,8 @@ class Painter:
                 if L < 0.5:
                     continue
                 rows.append([(x0 + x2) / 2, (y0 + y2) / 2, L / 2, e.sy, np.arctan2(y2 - y0, x2 - x0),
-                             K_LINE, e.seed, 0, *col, e.amax * xf, e.rough, e.soft])
+                             K_LINE, e.seed, 0, *col, e.amax * xf, e.rough * (1 - 0.65 * flat),
+                             e.soft * (1 - 0.6 * flat), 0.0])
                 if e.g >= 0 and e.g2 is not None and rev > 0.95:     # signals running along the wiring
                     act = min(self.fast[e.g], self.fast[e.g2])
                     if act > 0.2:
@@ -950,7 +1343,8 @@ class Painter:
                         for k in range(2):
                             u = (e.u + 0.5 * k) % 1.0
                             rows.append([x0 + (x2 - x0) * u, y0 + (y2 - y0) * u, r, r, 0, K_DISC, e.seed, 0,
-                                         *pc, min(1.0, (act - 0.2) * 3.0) * xf, 0.3, 0])
+                                         *pc, min(1.0, (act - 0.2) * 3.0) * xf, 0.3 * (1 - 0.65 * flat),
+                                         0.0, 0.25])
                 continue
             sc = 1.0
             if e.grow:
@@ -970,9 +1364,18 @@ class Painter:
                 soft *= 1.0 + 0.6 * f
                 col = col * (1 - 0.15 * f) + pal[4] * (0.15 * f)
             a = e.amax * (float(_smooth(0, 0.35, p)) if e.grow else min(1.0, p)) * xf
-            rows.append([e.x + ox, e.y + oy, sx, sy, ang, e.kind, e.seed, prm, *col, a, e.rough, soft])
-        self._fly_rows(rows, pal)
-        return np.asarray(rows, "f4").reshape(-1, 14)
+            # watercolour bleed: rough painted edges soak on everything but flat washes
+            bl = 0.0
+            if e.kind not in (K_LINE, K_SOFT) and not (self.style == "mondrian" and e.g >= 0):
+                if e.g == -3:
+                    bl = 0.6
+                elif max(sx, sy) < 26.0:
+                    bl = 0.25
+                else:
+                    bl = 0.35 + 0.65 * (float(self.fast[e.g]) if e.g >= 0 else 1.0)
+            rows.append([e.x + ox, e.y + oy, sx, sy, ang, e.kind, e.seed, prm, *col,
+                         a, e.rough * (1 - 0.65 * flat), soft * (1 - 0.6 * flat), bl * (1 - flat)])
+        return np.asarray(rows, "f4").reshape(-1, 15)
 
     def frame(self, lum, rate, dt, t, target):
         ctx = self.ctx
@@ -999,9 +1402,9 @@ class Painter:
         # motion: motifs are damped springs; bursts kick them, activity turns them
         self.vel += (-SPRING_K * self.off - SPRING_DAMP * self.vel) * dt
         self.off += self.vel * dt
-        self.pulse_v += (-30.0 * self.pulse - 6.0 * self.pulse_v) * dt
+        self.pulse_v += (-30.0 * self.pulse - 6.0 * self.pulse_v) * dt * self.kick_scale
         self.pulse += self.pulse_v * dt
-        self.spin += self.spin_dir * SPIN * self.fast * dt
+        self.spin += self.spin_dir * SPIN * self.spin_scale * self.fast * dt
         rise = np.flatnonzero((self.fast > 0.5) & (self.prev_fast <= 0.5))
         self.prev_fast = self.fast.copy()
         for gi in rise[:3]:                                   # a community switching on ripples
@@ -1017,11 +1420,13 @@ class Painter:
         if rn > 1.2:
             self.quiet = 0.0
         since = t - self.t_compose
-        if self.auto_recompose and ((onset and since > RECOMPOSE_MIN) or since > RECOMPOSE_MAX):
+        rs = self.recompose_scale
+        if self.auto_recompose and ((onset and since > RECOMPOSE_MIN * rs) or since > RECOMPOSE_MAX * rs):
             self.recompose()
         self.burst_cd -= dt
-        if rn > 1.5 and self.burst_cd <= 0:
-            self.burst_cd = 0.6
+        thr = 1.5 + 0.4 * self.tone["calm"] - 0.3 * self.tone["busy"]
+        if rn > thr and self.burst_cd <= 0:
+            self.burst_cd = 0.6 / self.kick_scale
             self._burst(int(np.argmax(self.fast)))
         for e in self.accents:
             e.ink *= np.exp(-dt / e.tau)
@@ -1074,9 +1479,20 @@ class Painter:
             ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
             self.v_mask.render(moderngl.TRIANGLE_STRIP)
             ctx.disable(moderngl.BLEND)
+            rows = self._fly_rows(PALETTES[self.pal])           # the fly itself + its paint pots
+            if len(rows):
+                self.canvas.use()
+                ctx.viewport = (0, 0, self.w, self.h)
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+                self.b_inst.write(rows.tobytes())
+                self.v_shape.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=len(rows))
+                ctx.disable(moderngl.BLEND)
 
         target.use()
         ctx.viewport = (0, 0, *target.size)
         self.canvas_tex.use(0)
         self.p_post["u_tex"] = 0
+        self.p_post["u_aged"] = self.tone["aged"]
+        self.p_post["u_warm"] = self.tone["warm"]
         self.v_post.render(moderngl.TRIANGLE_STRIP)
