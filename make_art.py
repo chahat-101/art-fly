@@ -10,6 +10,8 @@ examples:
   uv run make_art.py --seed 1 2 3 --style cutout  # several seeds, fixed style
   uv run make_art.py --seed 7 --style all           # one painting per style
   uv run make_art.py --seed 9 --video               # also an mp4 (uv add "imageio[ffmpeg]")
+  uv run make_art.py --seed 5 --fly                 # the painting appears stroke by stroke, brushed
+                                                    # on by a little fly; writes an mp4 (--fly-speed)
   uv run make_art.py                                # random seed, printed so you can reuse it
 """
 import argparse
@@ -139,19 +141,23 @@ def read_rgb(fbo, w, h):
 
 
 # ---------------------------------------------------------------- painting
-def paint(ctx, net, lay, *, seed, style, palette, seconds, start, size, video_path, fps):
+def paint(ctx, net, lay, *, seed, style, palette, seconds, start, size, video_path, fps,
+          fly=False, fly_speed=1.0):
     spikes, _, colors, edges, signs, groups, _ = net
     T, N = spikes.shape
     w, h = size
     tex = ctx.texture((w, h), 3)
     fbo = ctx.framebuffer([tex])
 
-    pt = P.Painter(ctx, w, h, lay, groups, signs, edges, seed=seed)
+    pt = P.Painter(ctx, w, h, lay, groups, signs, edges, seed=seed, neuron_colors=colors)
     while pt.style != style:
         pt.next_style()
     pt.old_els = []                              # no cross-fade from the default style
     if palette:
         pt.pal = palette
+    if fly:
+        pt.fly_begin(fly_speed)                  # the painting hides until the fly brushes it
+        pt.auto_recompose = False
 
     nd = np.array([NEURON_DECAY + DECAY_SPREAD, NEURON_DECAY, NEURON_DECAY - DECAY_SPREAD], np.float32)
     emit = (1.0 - nd) / (1.0 - nd).max()
@@ -178,18 +184,25 @@ def paint(ctx, net, lay, *, seed, style, palette, seconds, start, size, video_pa
     every = max(1, round(STEPS_PER_SEC / fps))
 
     dt = 1.0 / STEPS_PER_SEC
-    frames = int(seconds * STEPS_PER_SEC)
+    min_frames = int(seconds * STEPS_PER_SEC)
     hold = int(min(4.0, 0.3 * seconds) * STEPS_PER_SEC)   # no recomposing right before the final frame
+    frames = min_frames if not fly else max(min_frames, int(10 * 60 * STEPS_PER_SEC))
     t0 = time.time()
     for f in range(frames):
+        if not fly:
+            pt.auto_recompose = f < frames - hold
         advance()
-        pt.auto_recompose = f < frames - hold
         rate = float(np.asarray(spikes[(step - 1) % T]).mean()) * 20.0
         pt.frame(trail @ LUM_W, rate, dt, f * dt, fbo)
         if writer is not None and f % every == 0:
             writer.append_data(read_rgb(fbo, w, h))
-        if f % STEPS_PER_SEC == 0 or f == frames - 1:
+        if fly:                                            # run until the fly has painted everything
+            done = pt.fly_progress()
+            if f >= min_frames and done >= 1.0:
+                break
+        else:
             done = (f + 1) / frames
+        if f % STEPS_PER_SEC == 0:
             print(f"\r[art]   {style:<9} {done:5.0%}  ({time.time() - t0:5.1f}s)", end="", flush=True)
     print()
     img = read_rgb(fbo, w, h)
@@ -215,7 +228,12 @@ def main():
     ap.add_argument("--size", default="1920x1080", help="WIDTHxHEIGHT (default 1920x1080)")
     ap.add_argument("--outdir", default="art")
     ap.add_argument("--video", action="store_true", help="also write an mp4 of the painting being made")
+    ap.add_argument("--fly", action="store_true",
+                    help="reveal mode: the painting appears stroke by stroke as a little fly brushes it (writes mp4)")
+    ap.add_argument("--fly-speed", type=float, default=1.0, help="how fast the fly paints (default 1)")
     ap.add_argument("--fps", type=int, default=30, help="video frame rate (default 30)")
+    ap.add_argument("--open", default=True, action=argparse.BooleanOptionalAction,
+                    help="open the png in the default image viewer (default yes)")
     ap.add_argument("--data", default="out", help="folder with spikes.npy, positions.npy, render_assets.npz")
     ap.add_argument("--cache", default="connectome_cache.npz")
     args = ap.parse_args()
@@ -247,11 +265,25 @@ def main():
             name = f"seed{seed}_{style}_{pal}"
             print(f"[art] seed {seed}: {style} / {pal}, from step {start}")
             img = paint(ctx, net, lay, seed=seed, style=style, palette=pal, seconds=args.seconds, start=start,
-                        size=(w, h), video_path=os.path.join(args.outdir, name + ".mp4") if args.video else None,
-                        fps=args.fps)
+                        size=(w, h),
+                        video_path=os.path.join(args.outdir, name + ".mp4")
+                        if (args.video or args.fly) else None,
+                        fps=args.fps, fly=args.fly, fly_speed=args.fly_speed)
             path = os.path.join(args.outdir, name + ".png")
             Image.fromarray(img).save(path)
             print(f"[art]   -> {path}" + (f"  and {name}.mp4" if args.video else ""))
+            if args.open:
+                try:
+                    if sys.platform == "win32":
+                        os.startfile(path)                       # noqa: S606
+                    elif sys.platform == "darwin":
+                        import subprocess
+                        subprocess.Popen(["open", path])
+                    else:
+                        import subprocess
+                        subprocess.Popen(["xdg-open", path])
+                except OSError as e:
+                    print(f"[art]   (could not open {path}: {e})")
 
 
 if __name__ == "__main__":

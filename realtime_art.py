@@ -911,6 +911,7 @@ painter = Painter(
     _signs,
     _edges,
     seed=SEED,
+    neuron_colors=colors,
 )
 st.mode = 4
 st.orbit = True
@@ -968,6 +969,10 @@ def on_key(_w, key, _sc, action, mods):
     elif key == glfw.KEY_N and action == glfw.PRESS:
         painter.recompose()
         print("[rt] new composition")
+    elif key == glfw.KEY_F and action == glfw.PRESS:
+        painter.fly_begin() if not painter.fly_on else painter.fly_stop()
+        print("[rt] fly" + ("on - it repaints the canvas stroke by stroke" if painter.fly_on
+                            else " off"))
 
 
 glfw.set_key_callback(win, on_key)

@@ -52,6 +52,12 @@ KICK = 260.0            # px/s a population burst pushes nearby motifs away
 SPIN = 0.35             # rad/s a fully active motif turns
 WANDER = 10.0           # px of slow drift
 
+# fly reveal: the painting only shows where a little fly has brushed it
+FLY_SPEED = 380.0       # px/s flight speed at fly_speed = 1
+FLY_RATE = 13.0         # brush dabs per second at fly_speed = 1
+FLY_BRUSH = 26.0        # default brush radius, px
+FLY_TO_BRUSH = (13.0, 25.0)   # fly body -> brush tip offset (canvas space, y down)
+
 K_DISC, K_RING, K_RECT, K_TRI, K_LINE, K_ARC, K_BLOB, K_SOFT, K_HALF = range(9)
 
 # ------------------------------------------------------------------ shaders
@@ -152,6 +158,35 @@ FS_WASH = """
 uniform vec3 u_paper; uniform float u_alpha; out vec4 f;
 void main(){ f = vec4(u_paper, u_alpha); }"""
 
+VS_DAB = """
+#version 330
+uniform vec2 u_res;
+in vec2 in_quad; in vec4 in_dab;                  // x y r a
+out vec2 v_q; flat out vec4 v_dab;
+void main(){
+    vec2 q = in_quad*in_dab.z*1.35 + in_dab.xy;
+    v_q = q; v_dab = in_dab;
+    gl_Position = vec4(q/u_res*2.0 - 1.0, 0.0, 1.0);
+}"""
+
+FS_DAB = """
+#version 330
+in vec2 v_q; flat in vec4 v_dab; out vec4 f;
+""" + NOISE + """
+void main(){
+    float w = 0.85 + 0.3*(vnoise(v_q*0.05 + v_dab.xy*0.003) - 0.5);          // ragged brush load
+    float a = v_dab.w * w * (1.0 - smoothstep(v_dab.z*0.55, v_dab.z, length(v_q - v_dab.xy)));
+    f = vec4(a);
+}"""
+
+FS_MASKED = """
+#version 330
+uniform sampler2D u_layer, u_mask; in vec2 v_uv; out vec4 f;
+void main(){
+    float m = min(1.0, texture(u_mask, v_uv).r);
+    f = vec4(texture(u_layer, v_uv).rgb, m);
+}"""
+
 FS_POST = """
 #version 330
 uniform sampler2D u_tex; in vec2 v_uv; out vec4 f;
@@ -190,7 +225,7 @@ class El:
 
 
 class Painter:
-    def __init__(self, ctx, w, h, layout_xy, groups, signs, edges=None, seed=0):
+    def __init__(self, ctx, w, h, layout_xy, groups, signs, edges=None, seed=0, neuron_colors=None):
         self.ctx, self.w, self.h = ctx, w, h
         self.rng = np.random.RandomState(seed)
         x, y = (np.asarray(v, np.float64) for v in layout_xy)
@@ -225,6 +260,13 @@ class Painter:
             np.add.at(self.S, (gp[m], gq[m]), np.asarray(s)[m])
             self.S += self.S.T
 
+        # mean anatomical colour per community (the fly's brain badge)
+        self.com_col = None
+        if neuron_colors is not None:
+            cn = np.asarray(neuron_colors, np.float64)
+            self.com_col = np.stack([np.bincount(self.g, cn[:, k], self.G) / self.g_n
+                                     for k in range(3)], 1) + 1e-9
+
         self.fast = np.zeros(self.G)
         self.prev_fast = np.zeros(self.G)
         self.ink = np.zeros(self.G)
@@ -240,6 +282,16 @@ class Painter:
         self.inh_ema, self.inh_fast, self.inh_ink = None, 0.0, 0.0
         self.rate_ema, self.quiet = None, 0.0
         self.burst_cd = 0.0
+        # fly reveal state
+        self.fly_on = False
+        self.fly_speed = 1.0                          # dab/flight rate multiplier
+        self.fly_x, self.fly_y = w * 0.07, h * 0.90
+        self.fly_ang = -np.pi / 2
+        self.fly_st = "rest"                          # rest | fly | work
+        self.fly_plan, self.fly_set, self.fly_prog = [], set(), {}
+        self.fly_i = 0
+        self.fly_dabs, self.fly_di, self.fly_dabt = [], 0, 0.0
+        self.fly_stamp = []                           # (x, y, r, alpha) dabs for this frame
         self.t = 0.0
         self.style = "kandinsky"
         self.pal = STYLE_PALETTE[self.style]
@@ -259,18 +311,30 @@ class Painter:
 
         self.canvas, self.canvas_tex = fbo()
         self.under, self.under_tex = fbo()
+        self.layer, self.layer_tex = fbo()
+        rt = ctx.texture((w, h), 1, dtype="f2")       # reveal mask: paint shows where this is filled
+        rt.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        rt.repeat_x = rt.repeat_y = False
+        self.reveal_fbo, self.reveal_tex = ctx.framebuffer([rt]), rt
         q = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], np.float32))
         self.p_shape = ctx.program(vertex_shader=VS_SHAPE, fragment_shader=FS_SHAPE)
         self.p_copy = ctx.program(vertex_shader=VS_QUAD, fragment_shader=FS_COPY)
         self.p_wash = ctx.program(vertex_shader=VS_QUAD, fragment_shader=FS_WASH)
         self.p_post = ctx.program(vertex_shader=VS_QUAD, fragment_shader=FS_POST)
+        self.p_dab = ctx.program(vertex_shader=VS_DAB, fragment_shader=FS_DAB)
+        self.p_mask = ctx.program(vertex_shader=VS_QUAD, fragment_shader=FS_MASKED)
         self.p_shape["u_res"] = (w, h)
+        self.p_dab["u_res"] = (w, h)
         self.b_inst = ctx.buffer(reserve=1024 * 14 * 4, dynamic=True)
+        self.b_dab = ctx.buffer(reserve=128 * 6 * 4, dynamic=True)
         self.v_shape = ctx.vertex_array(self.p_shape, [
             (q, "2f", "in_quad"), (self.b_inst, "4f 4f 4f 2f/i", "in_a", "in_b", "in_c", "in_d")])
         self.v_copy = ctx.vertex_array(self.p_copy, [(q, "2f", "in_quad")])
         self.v_wash = ctx.vertex_array(self.p_wash, [(q, "2f", "in_quad")])
         self.v_post = ctx.vertex_array(self.p_post, [(q, "2f", "in_quad")])
+        self.v_mask = ctx.vertex_array(self.p_mask, [(q, "2f", "in_quad")])
+        self.v_dab = ctx.vertex_array(self.p_dab, [
+            (q, "2f", "in_quad"), (self.b_dab, "4f/i", "in_dab")])
 
     def _wash(self, fbo, alpha):
         fbo.use()
@@ -288,6 +352,7 @@ class Painter:
         self.ctx.disable(moderngl.BLEND)
         self._wash(self.under, 1.0)
         self._wash(self.canvas, 1.0)
+        self.reveal_fbo.clear(0, 0, 0, 0)
         self.ink[:] = 0
         self.fast[:] = 0
         self.inh_ink = 0.0
@@ -297,6 +362,34 @@ class Painter:
         self.pulse_v[:] = 0
         self.compose()
         self.old_els = []
+        if self.fly_on:
+            self.fly_prog = {}                        # the fly repaints everything from scratch
+
+    def fly_begin(self, speed=1.0):
+        """Reveal mode on: the canvas hides until the fly brushes it, and the fly
+        repaints the whole composition from scratch."""
+        self.fly_speed = float(speed)
+        self.fly_prog = {}
+        self.fly_plan = self._fly_plan()
+        self.fly_set = set(self.els)
+        self.fly_i = 0
+        self.fly_dabs, self.fly_di, self.fly_dabt = [], 0, 0.0
+        self.fly_stamp = []
+        self.fly_st = "fly"
+        self.fly_x, self.fly_y = self.w * 0.07, self.h * 0.90
+        self.fly_ang = -np.pi / 2
+        self.fly_on = True
+        self.reveal_fbo.clear(0, 0, 0, 0)
+
+    def fly_stop(self):
+        self.fly_on = False
+        self.fly_stamp = []
+
+    def fly_progress(self):
+        plan = self.fly_plan
+        if self.fly_on and plan:
+            return float(np.mean([self.fly_prog.get(e, 0.0) for e in plan]))
+        return 1.0
 
     def next_style(self):
         self.style = STYLES[(STYLES.index(self.style) + 1) % len(STYLES)]
@@ -375,6 +468,16 @@ class Painter:
         els = getattr(self, "_c_" + self.style)()
         els.sort(key=lambda e: e.z)
         self.els = els
+        self.fly_plan = self._fly_plan()
+        self.fly_i = 0
+        self.fly_st, self.fly_dabs, self.fly_di = "fly", [], 0
+        self.fly_set = set(els)
+
+    def _fly_plan(self):
+        """Painting order: big background shapes first, small details last."""
+        size = lambda e: (np.hypot(e.x2 - e.x, e.y2 - e.y) * max(e.sy, 1) if e.kind == K_LINE
+                          else abs(e.sx * e.sy) + 4.0)
+        return sorted(self.els, key=lambda e: (e.z, -size(e)))
 
     def _c_kandinsky(self):
         rng, W, H, M = self.rng, self.w, self.h, self.M
@@ -586,6 +689,147 @@ class Painter:
                           seed=rng.uniform(0, 100)))
         return els
 
+    # ---------------------------------------------------------- fly reveal
+    def _fly_dabs(self, e):
+        """Brush dab positions over one element's footprint, plus the brush radius."""
+        rng, r = self.rng, 0.0
+        pts = []
+        jitter = rng.uniform
+        if e.kind == K_LINE:
+            L = float(np.hypot(e.x2 - e.x, e.y2 - e.y))
+            r = float(np.clip(e.sy * 2.5 + 4.0, 7.0, 26.0))
+            n = int(np.clip(2.2 * L / max(0.75 * r, 1.0), 3, 40))
+            ux, uy = (e.x2 - e.x) / max(L, 1e-6), (e.y2 - e.y) / max(L, 1e-6)
+            px, py = -uy, ux
+            for k in range(n):
+                u = (k + 0.5) / n
+                j = rng.normal(0.0, 0.3 * e.sy + 0.2 * r)
+                pts.append((e.x + (e.x2 - e.x) * u + px * j, e.y + (e.y2 - e.y) * u + py * j))
+        elif e.kind == K_RECT:
+            r = float(np.clip(0.16 * max(e.sx, e.sy) + 8.0, 10.0, 56.0))
+            nx = int(np.clip(2 * e.sx / (0.7 * r), 1, 12))
+            ny = int(np.clip(2 * e.sy / (0.7 * r), 1, 12))
+            c, sn = np.cos(e.ang), np.sin(e.ang)
+            for v in range(ny):
+                for u in range(nx):
+                    lx = (u + 0.5) / nx * 2 - 1
+                    ly = (v + 0.5) / ny * 2 - 1
+                    lx += rng.normal(0, 0.10)
+                    ly += rng.normal(0, 0.10)
+                    pts.append((e.x + c * lx * e.sx - sn * ly * e.sy,
+                                e.y + sn * lx * e.sx + c * ly * e.sy))
+        else:
+            r = float(np.clip(0.13 * np.sqrt(max(e.sx * e.sy, 1.0)) + 8.0, 9.0, 52.0))
+            a2 = e.sx * e.sy / (r * r)
+            n = int(np.clip(2.4 * a2, 6, 56))
+            for _ in range(n):
+                aa = jitter(0, 2 * np.pi)
+                rad = np.sqrt(1.05 * jitter())                  # sqrt keeps density flat
+                pts.append((e.x + np.cos(aa) * rad * e.sx, e.y + np.sin(aa) * rad * e.sy))
+        return pts, r
+
+    def _fly_update(self, dt):
+        self.fly_stamp = []
+        if not self.fly_on:
+            return
+        speed = FLY_SPEED * self.fly_speed
+        dab_t = self.fly_x + FLY_TO_BRUSH[0], self.fly_y + FLY_TO_BRUSH[1]
+        if self.fly_st == "rest":                      # hover quietly in a corner, "listening"
+            hx, hy = 0.84 * self.w, 0.11 * self.h
+            tx = hx + 0.07 * self.w * np.cos(self.t * 0.5)
+            ty = hy + 0.05 * self.h * np.sin(self.t * 0.9)
+            d = np.hypot(tx - self.fly_x, ty - self.fly_y)
+            if d > 4.0:
+                u = min(speed * 0.3 * dt, d)
+                self.fly_x += (tx - self.fly_x) / d * u
+                self.fly_y += (ty - self.fly_y) / d * u
+                self._fly_turn(np.arctan2(ty - self.fly_y, tx - self.fly_x), 4.0 * dt)
+            return
+        if self.fly_i >= len(self.fly_plan):           # a recompose can only lengthen the plan
+            self.fly_st = "rest"
+            return
+        e = self.fly_plan[self.fly_i]
+        while self.fly_prog.get(e, 0.0) >= 1.0:        # already painted (e.g. after a recompose)
+            self.fly_i += 1
+            if self.fly_i >= len(self.fly_plan):
+                self.fly_st = "rest"
+                return
+            e = self.fly_plan[self.fly_i]
+        if self.fly_di >= len(self.fly_dabs):
+            if not self.fly_dabs:                      # fresh element: plan its strokes
+                self.fly_dabs, self.fly_r = self._fly_dabs(e)
+                if not self.fly_dabs:
+                    self.fly_prog[e] = 1.0
+                    self.fly_i += 1
+                    self.fly_st = "fly"
+                    return
+                self.fly_di = 0
+            else:                                      # last dab done: element is painted
+                self.fly_prog[e] = 1.0
+                self.fly_i += 1
+                self.fly_dabs, self.fly_di = [], 0
+                self.fly_st = "fly"
+                return
+        tx, ty = self.fly_dabs[self.fly_di]
+        bx, by = tx - FLY_TO_BRUSH[0], ty - FLY_TO_BRUSH[1]     # body stops where the tip touches
+        d = np.hypot(bx - self.fly_x, by - self.fly_y)
+        if d > max(2.0, speed * dt):
+            u = min(speed * dt, d)
+            self._fly_turn(np.arctan2(by - self.fly_y, bx - self.fly_x), 6.0 * dt)
+            self.fly_x += (bx - self.fly_x) / d * u
+            self.fly_y += (by - self.fly_y) / d * u
+            return
+        self.fly_x, self.fly_y = bx, by
+        self.fly_stamp.append((tx, ty, self.fly_r, 0.9))
+        n = len(self.fly_dabs)
+        prev = self.fly_prog.get(e, 0.0)
+        self.fly_prog[e] = max(prev, (self.fly_di + 1) / n)
+        self.fly_di += 1
+        self.fly_st = "work"
+
+    def _fly_turn(self, ta, u):
+        d = (ta - self.fly_ang + np.pi) % (2 * np.pi) - np.pi
+        self.fly_ang += d * min(1.0, u)
+
+    def _fly_rows(self, rows, pal):
+        """The fly itself: body, wings, brush and its little community badge (brain)."""
+        if not self.fly_on:
+            return
+        t = self.t
+        fx, fy = self.fly_x, self.fly_y
+        ang = self.fly_ang
+        tx, ty = fx + FLY_TO_BRUSH[0], fy + FLY_TO_BRUSH[1]
+        # wings
+        wf = np.sin(t * 36.0) * 0.30
+        for s in (-1.0, 1.0):
+            wa = ang + s * (1.20 + wf)
+            rows.append([fx - np.cos(ang) * 4.0, fy - np.sin(ang) * 4.0 - 2.0 * s * np.sin(wa) * 0.2,
+                         2.6, 10.5, wa, K_DISC, 4.0, 0, *pal[4], 0.40, 0.6, 0])
+        # brush handle and bristle
+        L = np.hypot(tx - fx, ty - fy) + 1e-3
+        rows.append([(fx + tx) / 2, (fy + ty) / 2, L / 2, 1.8, np.arctan2(ty - fy, tx - fx),
+                     K_LINE, 4.0, 0, *pal[3], 0.95, 0.25, 0])
+        if self.fly_st == "work" and self.fly_i < len(self.fly_plan):
+            e = self.fly_plan[self.fly_i]
+            rows.append([tx, ty, 4.4, 4.4, 0, K_DISC, 4.0, 0, *pal[min(e.role, 4)], 0.85, 0.15, 0])
+        # body, head, stripes
+        rows.append([fx, fy, 5.5, 9.5, ang, K_DISC, 4.0, 0, *pal[3], 0.96, 0.6, 0])
+        rows.append([fx + np.cos(ang) * 7.0, fy + np.sin(ang) * 7.0, 3.2, 3.4, ang, K_DISC, 4.0, 0,
+                     *pal[3], 1.0, 0.4, 0])
+        rows.append([fx - np.cos(ang) * 5.0, fy - np.sin(ang) * 5.0, 2.4, 4.6, ang, K_DISC, 4.0, 0,
+                     *pal[2], 0.55, 0.4, 0])
+        # brain badge: the community this fly is painting, glowing with its activity
+        g = -1
+        if self.fly_st == "work" and self.fly_i < len(self.fly_plan):
+            e = self.fly_plan[self.fly_i]
+            g = e.g if e.g >= 0 else (e.g2 if e.g2 is not None and e.g2 >= 0 else -1)
+        if g < 0:
+            g = int(np.argmax(self.fast))
+        by = fy - 30.0 + 1.6 * np.sin(t * 3.1)
+        bc = pal[3] if self.com_col is None else np.clip(self.com_col[g], 0, 1)
+        rows.append([fx, by, 6.5, 6.5, 0, K_RING, 4.0, 1.7, *bc, 0.85, 0.3, 0])
+        rows.append([fx, by, 3.2, 3.2, 0, K_DISC, 4.0, 0, *bc, 0.15 + 0.75 * float(self.fast[g]), 0.2, 0])
+
     # ------------------------------------------------------------ accents
     def _ripple(self, gi, n):
         """Thin rings that expand out of a motif and fade."""
@@ -675,6 +919,8 @@ class Painter:
         layers += [(e, fin) for e in self.els] + [(e, 1.0) for e in self.accents]
         for e, xf in layers:
             p = self._presence(e)
+            if self.fly_on and e in self.fly_set:      # only the fly's brush reveals a fresh element
+                p = max(p, self.fly_prog.get(e, 0.0))
             if p * xf < 0.01:
                 continue
             col = pal[e.role]
@@ -725,6 +971,7 @@ class Painter:
                 col = col * (1 - 0.15 * f) + pal[4] * (0.15 * f)
             a = e.amax * (float(_smooth(0, 0.35, p)) if e.grow else min(1.0, p)) * xf
             rows.append([e.x + ox, e.y + oy, sx, sy, ang, e.kind, e.seed, prm, *col, a, e.rough, soft])
+        self._fly_rows(rows, pal)
         return np.asarray(rows, "f4").reshape(-1, 14)
 
     def frame(self, lum, rate, dt, t, target):
@@ -791,11 +1038,14 @@ class Painter:
                 e.x, e.y = x0 + (x1 - x0) * e.u, y0 + (y1 - y0) * e.u
         self.accents = [e for e in self.accents if e.ink > 0.02]
 
-        # paint
+        # paint (in fly mode the shapes go to a scratch layer, which the fly's
+        # reveal mask composites onto fresh paper)
+        self._fly_update(dt)
         ctx.enable(moderngl.BLEND)
         ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
         self._wash(self.under, 1 - np.exp(-dt / 40.0))          # old compositions slowly sink into the paper
-        self.canvas.use()
+        dest = self.layer if self.fly_on else self.canvas
+        dest.use()
         ctx.viewport = (0, 0, self.w, self.h)
         ctx.disable(moderngl.BLEND)
         self._copy(self.under_tex, 1.0)
@@ -805,6 +1055,25 @@ class Painter:
             self.b_inst.write(rows.tobytes())
             self.v_shape.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=len(rows))
         ctx.disable(moderngl.BLEND)
+        if self.fly_on:
+            self.reveal_fbo.use()
+            ctx.viewport = (0, 0, self.w, self.h)
+            if self.fly_stamp:
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = moderngl.ONE, moderngl.ONE
+                self.b_dab.write(np.asarray(self.fly_stamp, "f4").tobytes())
+                self.v_dab.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=len(self.fly_stamp))
+            ctx.disable(moderngl.BLEND)
+            self.canvas.use()
+            ctx.viewport = (0, 0, self.w, self.h)
+            self._wash(self.canvas, 1.0)                        # fresh paper under the brush
+            self.layer_tex.use(0)
+            self.reveal_tex.use(1)
+            self.p_mask["u_layer"], self.p_mask["u_mask"] = 0, 1
+            ctx.enable(moderngl.BLEND)
+            ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self.v_mask.render(moderngl.TRIANGLE_STRIP)
+            ctx.disable(moderngl.BLEND)
 
         target.use()
         ctx.viewport = (0, 0, *target.size)
