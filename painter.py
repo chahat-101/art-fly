@@ -66,7 +66,8 @@ WANDER = 10.0           # px of slow drift
 FLY_SPEED = 380.0       # px/s flight speed at fly_speed = 1
 FLY_RATE = 13.0         # brush dabs per second at fly_speed = 1
 FLY_BRUSH = 26.0        # default brush radius, px
-FLY_TO_BRUSH = (13.0, 25.0)   # fly body -> brush tip offset (canvas space, y down)
+FLY_TO_BRUSH = (18.0, 35.0)   # fly body -> brush tip offset (canvas space, y down)
+FLY_SCALE = 1.4               # visual size of the fly, its brush and badge
 
 K_DISC, K_RING, K_RECT, K_TRI, K_LINE, K_ARC, K_BLOB, K_SOFT, K_HALF, K_HEX = range(10)
 
@@ -1244,6 +1245,7 @@ class Painter:
         t = self.t
         fx, fy = self.fly_x, self.fly_y
         ang = self.fly_ang
+        S = FLY_SCALE
         tx, ty = fx + FLY_TO_BRUSH[0], fy + FLY_TO_BRUSH[1]
         rows = []
         # paint pots sit along the right edge, one per role; rims glow with the colour inside
@@ -1254,14 +1256,14 @@ class Painter:
         wf = np.sin(t * 36.0 / self.fly_speed ** 0.4) * 0.30
         for s in (-1.0, 1.0):
             wa = ang + s * (1.20 + wf)
-            rows.append([fx - np.cos(ang) * 4.0, fy - np.sin(ang) * 4.0 - 2.0 * s * np.sin(wa) * 0.2,
-                         2.6, 10.5, wa, K_DISC, 4.0, 0, *pal[4], 0.40, 0.6, 0, 0])
+            rows.append([fx - np.cos(ang) * 4.0 * S, fy - np.sin(ang) * 4.0 * S - 2.0 * s * np.sin(wa) * 0.2,
+                         2.6 * S, 10.5 * S, wa, K_DISC, 4.0, 0, *pal[4], 0.40, 0.6, 0, 0])
         # brush handle and bristle (the tip carries the colour of the current pot)
         L = np.hypot(tx - fx, ty - fy) + 1e-3
-        rows.append([(fx + tx) / 2, (fy + ty) / 2, L / 2, 1.8, np.arctan2(ty - fy, tx - fx),
+        rows.append([(fx + tx) / 2, (fy + ty) / 2, L / 2, 1.8 * S, np.arctan2(ty - fy, tx - fx),
                      K_LINE, 4.0, 0, *pal[3], 0.95, 0.25, 0, 0])
         bc = pal[self.fly_ink_role] if self.fly_ink_role >= 0 else pal[3]
-        br = 2.2 + 1.6 * self.fly_ink                          # the tip shrinks as the ink runs out
+        br = (2.2 + 1.6 * self.fly_ink) * S                     # the tip shrinks as the ink runs out
         rows.append([tx, ty, br, br, 0, K_DISC, 4.0, 0, *bc, 0.25 + 0.6 * self.fly_ink, 0.15, 0, 0])
         # refill splash: a little fan of drops above the pot right after a dip
         if self.fly_splash > 0.0 and self.fly_splash_at is not None:
@@ -1274,11 +1276,11 @@ class Painter:
                              1.6 + 0.3 * k, 1.6 + 0.3 * k, 0, K_DISC, 4.0, 0,
                              *pal[prole], 0.55 * (1.0 - fall), 0.3, 0, 0])
         # body, head, stripes
-        rows.append([fx, fy, 5.5, 9.5, ang, K_DISC, 4.0, 0, *pal[3], 0.96, 0.6, 0, 0])
-        rows.append([fx + np.cos(ang) * 7.0, fy + np.sin(ang) * 7.0, 3.2, 3.4, ang, K_DISC, 4.0, 0,
-                     *pal[3], 1.0, 0.4, 0, 0])
-        rows.append([fx - np.cos(ang) * 5.0, fy - np.sin(ang) * 5.0, 2.4, 4.6, ang, K_DISC, 4.0, 0,
-                     *pal[2], 0.55, 0.4, 0, 0])
+        rows.append([fx, fy, 5.5 * S, 9.5 * S, ang, K_DISC, 4.0, 0, *pal[3], 0.96, 0.6, 0, 0])
+        rows.append([fx + np.cos(ang) * 7.0 * S, fy + np.sin(ang) * 7.0 * S, 3.2 * S, 3.4 * S, ang,
+                     K_DISC, 4.0, 0, *pal[3], 1.0, 0.4, 0, 0])
+        rows.append([fx - np.cos(ang) * 5.0 * S, fy - np.sin(ang) * 5.0 * S, 2.4 * S, 4.6 * S, ang,
+                     K_DISC, 4.0, 0, *pal[2], 0.55, 0.4, 0, 0])
         # brain badge: the community this fly is painting, glowing with its activity
         g = -1
         if self.fly_st == "work" and self.fly_i < len(self.fly_plan):
@@ -1286,10 +1288,10 @@ class Painter:
             g = e.g if e.g >= 0 else (e.g2 if e.g2 is not None and e.g2 >= 0 else -1)
         if g < 0:
             g = int(np.argmax(self.fast))
-        by = fy - 30.0 + 1.6 * np.sin(t * 3.1)
+        by = fy - 30.0 * S + 1.6 * np.sin(t * 3.1)
         cc = pal[3] if self.com_col is None else np.clip(self.com_col[g], 0, 1)
-        rows.append([fx, by, 6.5, 6.5, 0, K_RING, 4.0, 1.7, *cc, 0.85, 0.3, 0, 0])
-        rows.append([fx, by, 3.2, 3.2, 0, K_DISC, 4.0, 0, *cc, 0.15 + 0.75 * float(self.fast[g]), 0.2, 0, 0])
+        rows.append([fx, by, 6.5 * S, 6.5 * S, 0, K_RING, 4.0, 1.7 * S, *cc, 0.85, 0.3, 0, 0])
+        rows.append([fx, by, 3.2 * S, 3.2 * S, 0, K_DISC, 4.0, 0, *cc, 0.15 + 0.75 * float(self.fast[g]), 0.2, 0, 0])
         return np.asarray(rows, "f4").reshape(-1, 15)
 
     # ------------------------------------------------------------ accents
