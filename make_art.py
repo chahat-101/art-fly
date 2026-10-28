@@ -152,14 +152,17 @@ def paint(ctx, net, lay, *, seed, style, palette, seconds, start, size, video_pa
     fbo = ctx.framebuffer([tex])
 
     pt = P.Painter(ctx, w, h, lay, groups, signs, edges, seed=seed, neuron_colors=colors)
+    if essence:                                  # art-direction tone knobs, before any composition
+        pt.apply_tone(essence)
+        print(f"[art]   tone: {', '.join(pt.active_tone()) or 'none'}")
     while pt.style != style:
         pt.next_style()
     pt.old_els = []                              # no cross-fade from the default style
     if palette:
         pt.pal = palette
-    if essence:                                  # art-direction tone knobs
-        pt.apply_tone(essence)
-        print(f"[art]   tone: {', '.join(pt.active_tone()) or 'none'}")
+    if essence:
+        pt.compose()                             # rebuild so the tone shapes the composition
+        pt.old_els = []
     if fly:
         pt.fly_begin(fly_speed)                  # the painting hides until the fly brushes it
         pt.auto_recompose = False
@@ -302,10 +305,12 @@ def main():
                         os.startfile(path)                       # noqa: S606
                     elif sys.platform == "darwin":
                         import subprocess
-                        subprocess.Popen(["open", path])
+                        subprocess.Popen(["open", path], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
                     else:
                         import subprocess
-                        subprocess.Popen(["xdg-open", path])
+                        subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
                 except OSError as e:
                     print(f"[art]   (could not open {path}: {e})")
 

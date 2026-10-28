@@ -930,6 +930,7 @@ if pstyle or ess:
     painter.apply_tone(ess)
     if ess:
         print(f"[rt] tone {', '.join(painter.active_tone()) or 'none'}")
+        painter.compose()                        # rebuild so the tone shapes the composition
 st.mode = 4
 st.orbit = True
 
