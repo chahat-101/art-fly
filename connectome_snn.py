@@ -35,6 +35,7 @@ W_RATE, W_DEAD, W_CHI, W_BRANCH, W_RUNAWAY = 1.0, 0.5, 0.6, 0.4, 3.0
 CURRICULUM_START, CURRICULUM_END = 15, 45  # ramp chi/branch in over this epoch range
 
 EPOCHS, LR, WARMUP = 150, 0.01, 5
+EPOCHS = int(os.environ.get("EPOCHS", "150"))  # overridable for quick pipeline smoke-tests
 SEED = int(os.environ.get("FLY_SEED", "0"))
 
 torch.manual_seed(SEED)
@@ -536,7 +537,32 @@ def _hex_to_rgb(h):
     return np.array([int(h[i : i + 2], 16) / 255.0 for i in (0, 2, 4)], dtype=np.float32)
 
 
-# --- community detection drives hue, so colour encodes anatomy rather than activity ---
+def _consolidate_communities(ids, k_keep=12):
+    """Keep the k biggest communities; fold every leftover community into the kept
+    one it is most strongly wired to (summed |W| flow). Keeps G sane so hues stay
+    distinct and per-community ink signals are smooth instead of binary flickers."""
+    ids = np.asarray(ids, np.int32).copy()
+    u, sizes = np.unique(ids, return_counts=True)
+    if len(u) > k_keep:
+        big = u[np.argsort(-sizes)][:k_keep]
+        D = (ids[:, None] == big[None, :]).astype(np.float32)      # N x k_keep
+        flows = np.abs(W) @ D                                       # per-neuron flow into each kept group
+        assign = big[flows.argmax(1)]
+        ids = np.where(np.isin(ids, big), ids, assign)
+    u, sizes = np.unique(ids, return_counts=True)
+    order = u[np.argsort(-sizes)]                                   # relabel biggest = 0
+    lut = np.full(ids.max() + 1, -1, np.int32)
+    for r, c in enumerate(order):
+        lut[c] = r
+    return lut[ids], len(u)
+
+
+# community detection with a BOUNDED resolution search. The old unbounded
+# escalation kept splitting until the graph was 647 singletons, which made
+# every artwork hue rank-tied mush and its ink signals binary flickers.
+# We stop at the first resolution whose largest group is < 35% of neurons
+# with <= 24 communities; then consolidation folds the rest.
+community_ids, n_comm, res = None, 0, 1.0
 try:
     import igraph as ig
 
@@ -546,22 +572,30 @@ try:
     up = Ws.row < Ws.col
     g_ig = ig.Graph(n=N, edges=list(zip(Ws.row[up].tolist(), Ws.col[up].tolist())), directed=False)
     g_ig.es["weight"] = Ws.data[up].tolist()
-    # if one community swallows most of the graph, most neurons share one hue
-    # and the art is monochrome no matter what the renderer does. Raise the
-    # resolution until the largest community holds < 40% of neurons.
-    res = 1.0
-    for _try in range(6):
-        community_ids = np.array(
-            g_ig.community_leiden(weights="weight", resolution=res, n_iterations=3).membership,
+
+    def _leiden(r):
+        return np.array(
+            g_ig.community_leiden(weights="weight", resolution=r, n_iterations=3).membership,
             dtype=np.int32,
         )
-        if float(np.bincount(community_ids).max()) / N < 0.40:
-            break
-        res *= 2.0
+
+    picked = None
+    for res in (0.5, 1.0, 1.75, 3.0, 5.0):          # bounded: no runaway escalation
+        ids = _leiden(res)
+        mx = float(np.bincount(ids).max()) / N
+        nc = int(ids.max()) + 1
+        if 2 <= nc <= 24:
+            picked = ids
+            if mx < 0.35:
+                break
+    if picked is None:                               # last resort: the most balanced bounded set
+        print("[render] bounded Leiden search never balanced; merging coarsest")
+        picked = _leiden(0.5)
+    community_ids, _n0 = _consolidate_communities(picked, k_keep=12)
     n_comm = int(community_ids.max()) + 1
     _sizes = np.sort(np.bincount(community_ids))[::-1]
     print(
-        f"[render] Leiden: {n_comm} communities at resolution {res:g} | "
+        f"[render] Leiden: {n_comm} communities (from {_n0}) at resolution {res:g} | "
         f"largest holds {_sizes[0] / N:.0%} | top-5 sizes {_sizes[:5].tolist()}"
     )
 except Exception as e:
